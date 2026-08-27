@@ -1,0 +1,15 @@
+# Build artifacts
+fr-media-service
+fr-webconfig
+fr-ai-service
+fr-rknn-benchmark
+fr-rknn-inspect
+out/
+
+# Runtime face database (contains personal biometric data)
+config/database.json
+
+# SDK build output
+*.o
+*.a
+*.so
