@@ -3,6 +3,7 @@
 #include "fr_face_db.hpp"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -13,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -326,12 +328,124 @@ NalStartInfo ScanNalStart(const uint8_t* data, size_t size, bool hevc) {
     return info;
 }
 
-bool IsStartPacket(const uint8_t* data, size_t size, RK_CODEC_ID_E codec) {
-    if (!data || size == 0) return false;
-    const bool hevc = codec == RK_VIDEO_ID_HEVC;
-    const NalStartInfo info = ScanNalStart(data, size, hevc);
-    if (hevc) return info.vps && info.sps && info.pps && info.idr;
-    return info.sps && info.pps && info.idr;
+// Extract SPS/PPS (H.264) or VPS/SPS/PPS (H.265) NAL byte slices, start codes
+// preserved, into out.  Used to make every SD segment self-decodable even when
+// the encoder stops repeating parameter sets after the first GOP.
+static bool CaptureParamSets(const uint8_t* data, size_t size, bool hevc,
+                             std::string& out) {
+    out.clear();
+    size_t i = 0;
+    while (i + 4 <= size) {
+        size_t header = 0;
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            header = i + 3;
+        } else if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
+                   data[i + 3] == 1) {
+            header = i + 4;
+        } else {
+            ++i;
+            continue;
+        }
+        size_t nal_end = header + 1;
+        for (size_t j = header + 1; j + 1 < size; ++j) {
+            if (data[j - 1] == 0 && data[j] == 0 && data[j + 1] == 1) {
+                nal_end = j - 1;
+                break;
+            }
+            if (j + 2 < size && data[j] == 0 && data[j + 1] == 0 &&
+                data[j + 2] == 0 && j + 3 < size && data[j + 3] == 1) {
+                nal_end = j;
+                break;
+            }
+        }
+        if (nal_end == header + 1) nal_end = size;
+        if (nal_end > (header + 1) && nal_end <= size) {
+            const unsigned type = hevc ? ((data[header] >> 1) & 0x3f)
+                                       : (data[header] & 0x1f);
+            const bool keep = hevc ? (type == 32 || type == 33 || type == 34)
+                                   : (type == 7 || type == 8);
+            if (keep) out.append(reinterpret_cast<const char*>(data + i), nal_end - i);
+        }
+        i = nal_end + (nal_end < size ? 1 : 0);
+        if (i >= size) break;
+    }
+    return !out.empty();
+}
+
+// Match removable SD whole-disk (mmcblkN) or partition (mmcblkNpM) devices.
+static bool IsSdBlockName(const char* name) {
+    if (strncmp(name, "mmcblk", 6) != 0) return false;
+    const char* p = name + 6;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') ++p;
+    if (*p == 'p') {
+        ++p;
+        if (*p < '0' || *p > '9') return false;
+    }
+    return *p == '\0';
+}
+
+static bool SdBlockPresent() {
+    DIR* d = opendir("/dev");
+    if (!d) return false;
+    bool found = false;
+    for (dirent* entry = nullptr; (entry = readdir(d)) != nullptr;) {
+        if (IsSdBlockName(entry->d_name)) { found = true; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static bool SdMounted() {
+    FILE* mounts = fopen("/proc/mounts", "r");
+    if (!mounts) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), mounts)) {
+        char source[128] = {0}, target[128] = {0};
+        if (sscanf(line, "%127s %127s", source, target) == 2 &&
+            strcmp(target, "/mnt/sdcard") == 0 &&
+            strncmp(source, "/dev/mmcblk", 11) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(mounts);
+    return found;
+}
+
+// Attach a removable FAT32 SD card at /mnt/sdcard as soon as the controller
+// reports a card.  Runs as root so no external mdev/udev rule is required;
+// a missing/blank card simply keeps WAITING_FOR_SD.
+static bool AttachSd() {
+    if (mkdir("/mnt/sdcard", 0755) != 0 && errno != EEXIST) return false;
+    // Prefer partitions (mmcblkNpM), try each card in order, then its raw
+    // whole-disk device as a fallback for superfloppy-format cards.
+    std::vector<std::string> candidates;
+    DIR* d = opendir("/dev");
+    if (d) {
+        for (dirent* entry = nullptr; (entry = readdir(d)) != nullptr;) {
+            if (!IsSdBlockName(entry->d_name)) continue;
+            candidates.push_back(std::string("/dev/") + entry->d_name);
+        }
+        closedir(d);
+    }
+    if (candidates.empty()) return false;
+    // Partitions (mmcblkNpM) first, then whole-disk devices as a fallback.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const std::string& a, const std::string& b) {
+                  const bool pa = a.find('p') != std::string::npos;
+                  const bool pb = b.find('p') != std::string::npos;
+                  if (pa != pb) return pa;
+                  return a.size() != b.size() ? a.size() < b.size() : a < b;
+              });
+    for (const std::string& dev : candidates) {
+        if (SdMounted()) return true;
+        if (mount(dev.c_str(), "/mnt/sdcard", "vfat",
+                  MS_NOSUID | MS_NOEXEC | MS_RELATIME, nullptr) == 0)
+            return true;
+    }
+    return false;
 }
 
 bool SdAvailable() {
@@ -360,23 +474,14 @@ bool SdAvailable() {
     // silently filled and is explicitly rejected.
     struct stat st;
     if (stat("/mnt/sdcard", &st) != 0 || !S_ISDIR(st.st_mode)) return false;
-    if (access("/mnt/sdcard", R_OK | W_OK) != 0) return false;
 
-    FILE* mounts = fopen("/proc/mounts", "r");
-    if (!mounts) return false;
-    char line[256];
-    bool found = false;
-    while (fgets(line, sizeof(line), mounts)) {
-        char source[128] = {0}, target[128] = {0}, fstype[32] = {0};
-        if (sscanf(line, "%127s %127s %31s", source, target, fstype) == 3 &&
-            strcmp(target, "/mnt/sdcard") == 0 &&
-            strncmp(source, "/dev/mmcblk", 11) == 0) {
-            found = true;
-            break;
-        }
-    }
-    fclose(mounts);
-    return found;
+    // Card already attached: require the block device to still exist so a
+    // pulled card or an unclean mount does not look "available" forever.
+    if (SdMounted()) return SdBlockPresent();
+
+    // Card present but not yet mounted (hot-plug or first boot): attach now.
+    if (SdBlockPresent()) return AttachSd();
+    return false;
 }
 
 static uint64_t SegMonotonicSec() {
@@ -434,6 +539,12 @@ public:
         bytes_written_ = 0;
     }
 
+    void SetHeader(const std::string& h) { header_cache_ = h; }
+    bool HasHeader() const { return !header_cache_.empty(); }
+
+    // size==0 means the incoming frame carries its own parameter sets.
+    void SetPacketHasPs(bool has_ps) { packet_has_ps_ = has_ps; }
+
     bool Write(const uint8_t* data, size_t size) {
         if (!g_record_enabled) return false;
         if (!SdAvailable()) {
@@ -447,6 +558,23 @@ public:
         }
         sd_waiting_logged_ = false;
         if (!EnsureOpen()) return false;
+
+        if (first_write_ && !packet_has_ps_ && !header_cache_.empty()) {
+            size_t written = 0;
+            while (written < header_cache_.size()) {
+                const ssize_t rc = write(fd_, header_cache_.data() + written,
+                                         header_cache_.size() - written);
+                if (rc <= 0) {
+                    std::printf("[REC] header write failed errno=%d\n", errno);
+                    Close();
+                    return false;
+                }
+                written += static_cast<size_t>(rc);
+            }
+            bytes_written_ += header_cache_.size();
+        }
+        first_write_ = false;
+        packet_has_ps_ = false;
 
         size_t written = 0;
         while (written < size) {
@@ -475,15 +603,19 @@ private:
     bool StorageOkToStart() {
         struct statvfs vfs;
         std::string probe = g_record_dir;
-        if (statvfs(probe.c_str(), &vfs) != 0) {
-            const size_t slash = probe.find_last_of('/');
-            if (slash != std::string::npos && slash > 0) {
-                probe = probe.substr(0, slash);
-                if (statvfs(probe.c_str(), &vfs) != 0) return false;
-            } else {
-                return false;
+        bool ok = false;
+        // Walk up to the nearest existing ancestor (the mount point on first
+        // use, when DCIM/ai subdirectories do not exist yet).
+        for (int depth = 0; depth < 16; ++depth) {
+            if (statvfs(probe.c_str(), &vfs) == 0) {
+                ok = true;
+                break;
             }
+            const size_t slash = probe.find_last_of('/');
+            if (slash == std::string::npos || slash == 0) break;
+            probe = probe.substr(0, slash);
         }
+        if (!ok) return false;
         const uint64_t free_bytes =
             static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
         const uint64_t min_needed =
@@ -546,6 +678,8 @@ private:
             return false;
         }
         bytes_written_ = 0;
+        first_write_ = true;
+        packet_has_ps_ = false;
         std::printf("[REC] state=RECORDING temp=%s\n", temp_path_.c_str());
         NotifyRecordState("RECORDING", temp_path_);
         return true;
@@ -555,8 +689,11 @@ int fd_ = -1;
     uint64_t opened_monotonic_ = 0;
     time_t segment_start_utc_ = 0;
     size_t bytes_written_ = 0;
+    bool first_write_ = true;
+    bool packet_has_ps_ = false;
     bool sd_waiting_logged_ = false;
     uint64_t last_fail_log_ms_ = 0;
+    std::string header_cache_;
     std::string ext_ = ".h264";
     std::string prefix_ = "ai_";
     std::string temp_path_;
@@ -699,6 +836,8 @@ int TestVencInit(int chnId, int width, int height, RK_CODEC_ID_E enType) {
     stAttr.stVencAttr.u32PicHeight = height;
     stAttr.stVencAttr.u32VirWidth = width;
     stAttr.stVencAttr.u32VirHeight = height;
+    stAttr.stVencAttr.u32MaxPicWidth = width;
+    stAttr.stVencAttr.u32MaxPicHeight = height;
     stAttr.stVencAttr.u32StreamBufCnt = 3;
     stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
 
@@ -710,6 +849,7 @@ int TestVencInit(int chnId, int width, int height, RK_CODEC_ID_E enType) {
         stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateDen = 1;
         stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateNum = 30;
         stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateDen = 1;
+        stAttr.stVencAttr.u32Profile = H264E_PROFILE_HIGH;
     } else if (enType == RK_VIDEO_ID_HEVC) {
         stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
         stAttr.stRcAttr.stH265Cbr.u32Gop = 30;
@@ -739,46 +879,53 @@ void* RtspStreamingThread(void* /*arg*/) {
 
     while (!g_quit) {
         int s32Ret = RK_MPI_VENC_GetStream(0, &stFrame, 1000);
-        if (s32Ret == RK_SUCCESS) {
-            void* data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
-            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
-            const size_t len = stFrame.pstPack->u32Len;
+        if (s32Ret != RK_SUCCESS) continue;
+        void* data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        const size_t len = stFrame.pstPack->u32Len;
 
-            // SD recording on the same VENC loop (single consumer).
-            if (g_record_enabled && bytes && len > 0) {
-                if (recorder.NeedsStart() && !idr_requested) {
-                    if (SdAvailable()) {
-                        const int idr_rc = RK_MPI_VENC_RequestIDR(0, RK_TRUE);
-                        idr_requested = (idr_rc == RK_SUCCESS);
-                        if (idr_requested) {
-                            std::printf("[REC] state=REQUEST_IDR\n");
-                            NotifyRecordState("REQUEST_IDR");
-                        }
-                        sd_wait_logged = false;
-                    } else if (!sd_wait_logged) {
-                        std::printf("[REC] state=WAITING_FOR_SD\n");
-                        NotifyRecordState("WAITING_FOR_SD");
-                        sd_wait_logged = true;
-                    }
-                }
-                const bool start = IsStartPacket(bytes, len, g_venc_codec);
-                if ((!recorder.NeedsStart() || start) &&
-                    recorder.Write(bytes, len)) {
-                    sd_wait_logged = false;
-                    if (recorder.NeedsStart() || idr_requested) {
-                        idr_requested = false;
-                    }
-                }
-            } else if (recorder.IsOpen()) {
-                recorder.Close();
+// SD recording on the same VENC loop (single consumer).  Start a segment the
+// moment a natural IDR arrives (RK_MPI_VENC_RequestIDR can be unsupported on
+// some builds), prepending the last cached SPS/PPS so the segment is
+// self-decodable even when the encoder only emits parameter sets once.
+if (g_record_enabled && bytes && len > 0) {
+    const bool hevc = g_venc_codec == RK_VIDEO_ID_HEVC;
+    std::string ps_cache;
+    recorder.SetPacketHasPs(CaptureParamSets(bytes, len, hevc, ps_cache));
+    if (!ps_cache.empty()) recorder.SetHeader(ps_cache);
+    const NalStartInfo info = ScanNalStart(bytes, len, hevc);
+    if (recorder.NeedsStart() && !idr_requested) {
+        if (SdAvailable()) {
+            const int idr_rc = RK_MPI_VENC_RequestIDR(0, RK_FALSE);
+            idr_requested = (idr_rc == RK_SUCCESS);
+            if (idr_requested) {
+                std::printf("[REC] state=REQUEST_IDR\n");
+                NotifyRecordState("REQUEST_IDR");
             }
-
-            if (g_rtsp_session) {
-                rtsp_tx_video(g_rtsp_session, bytes, len, stFrame.pstPack->u64PTS);
-                rtsp_do_event(g_rtsplive);
-            }
-            RK_MPI_VENC_ReleaseStream(0, &stFrame);
+            sd_wait_logged = false;
+        } else if (!sd_wait_logged) {
+            std::printf("[REC] state=WAITING_FOR_SD\n");
+            NotifyRecordState("WAITING_FOR_SD");
+            sd_wait_logged = true;
         }
+    }
+    // Require a decodable start: an IDR plus cached parameter sets.
+    const bool start = info.idr && recorder.HasHeader();
+    if ((!recorder.NeedsStart() || start) && recorder.Write(bytes, len)) {
+        sd_wait_logged = false;
+        if (recorder.NeedsStart() || idr_requested) {
+            idr_requested = false;
+        }
+    }
+} else if (recorder.IsOpen()) {
+    recorder.Close();
+}
+
+        if (g_rtsp_session) {
+            rtsp_tx_video(g_rtsp_session, bytes, len, stFrame.pstPack->u64PTS);
+            rtsp_do_event(g_rtsplive);
+        }
+        RK_MPI_VENC_ReleaseStream(0, &stFrame);
     }
     if (recorder.IsOpen()) recorder.Close();
     if (stFrame.pstPack) {
