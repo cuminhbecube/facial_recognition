@@ -655,9 +655,19 @@ private:
     bool EnsureOpen() {
         if (fd_ >= 0) return true;
         if (g_record_dir.empty()) return false;
+        // System clock at boot may briefly read 1970 until the ISP license /
+        // NTP sync lands; refuse to open under a bogus "19700101" directory.
+        const time_t now = time(nullptr);
+        if (now < 1577836800LL) {
+            if (!clock_warned_) {
+                KeepaliveLog("[REC] waiting for wall-clock sync");
+                clock_warned_ = true;
+            }
+            return false;
+        }
+        clock_warned_ = false;
         if (!StorageOkToStart()) return false;
 
-        const time_t now = time(nullptr);
         const std::string ts = VietnamTimestamp(now);
         const std::string date_dir = g_record_dir + "/" + ts.substr(0, 8);
         if (!MkdirRecursive(date_dir.c_str())) return false;
@@ -693,6 +703,7 @@ int fd_ = -1;
     bool packet_has_ps_ = false;
     bool sd_waiting_logged_ = false;
     uint64_t last_fail_log_ms_ = 0;
+    bool clock_warned_ = false;
     std::string header_cache_;
     std::string ext_ = ".h264";
     std::string prefix_ = "ai_";
