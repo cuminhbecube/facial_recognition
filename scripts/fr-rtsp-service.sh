@@ -12,9 +12,9 @@ CONFIG_FILE=/oem/usr/etc/facial-recognition/rtsp.conf
 MODEL_PATH=/oem/usr/share/facial-recognition/model/yolov5n-face-rv1106.rknn
 DB_PATH=/oem/usr/etc/facial-recognition/database.json
 
-WIDTH=2304
-HEIGHT=1296
-BITRATE_KBPS=4096
+WIDTH=1920
+HEIGHT=1080
+BITRATE_KBPS=1024
 CODEC=h265
 
 if [ -r "$CONFIG_FILE" ]; then
