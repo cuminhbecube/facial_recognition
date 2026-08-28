@@ -9,7 +9,7 @@ RK_APP_CROSS_CFLAGS ?= -mfpu=neon -mfloat-abi=hard
 SHELL := /bin/bash
 PKG_NAME := facial_recognition
 PKG_BIN := out
-MEDIA_OUT := ../../output/out/media_out
+MEDIA_OUT ?= ../../../output/out/media_out
 RKNN_PATH := ../capture_ai/3rdparty/rknpu2
 MODEL_SRC := ../capture_ai/model/yolov5n-face-rv1106.rknn
 
@@ -43,12 +43,10 @@ RKNN_INSPECT_BIN := fr-rknn-inspect
 RKNN_INSPECT_SRC := src/fr_rknn_inspect.cpp
 RKNN_BENCHMARK_BIN := fr-rknn-benchmark
 RKNN_BENCHMARK_SRC := src/fr_rknn_benchmark.cpp
-DETECTOR_VERIFY_BIN := fr-detector-verify
-DETECTOR_VERIFY_SRC := src/fr_detector_verify.cpp src/fr_face_detector.cpp src/fr_face_recognizer.cpp src/fr_face_db.cpp
 
 .PHONY: all clean info
 
-all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(DETECTOR_VERIFY_BIN)
+all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN)
 	mkdir -p $(PKG_BIN)/usr/bin $(PKG_BIN)/usr/share/facial-recognition/model $(PKG_BIN)/usr/etc/facial-recognition $(PKG_BIN)/root/etc/init.d
 	cp -f scripts/fr-camera-validate.sh $(PKG_BIN)/usr/bin/fr-camera-validate
 	cp -f scripts/fr-rtsp-service.sh $(PKG_BIN)/usr/bin/fr-rtsp-service
@@ -61,7 +59,6 @@ all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(DETECTO
 	cp -f $(MEDIA_BIN) $(PKG_BIN)/usr/bin/fr-ai-service
 	cp -f $(RKNN_INSPECT_BIN) $(PKG_BIN)/usr/bin/$(RKNN_INSPECT_BIN)
 	cp -f $(RKNN_BENCHMARK_BIN) $(PKG_BIN)/usr/bin/$(RKNN_BENCHMARK_BIN)
-	cp -f $(DETECTOR_VERIFY_BIN) $(PKG_BIN)/usr/bin/$(DETECTOR_VERIFY_BIN)
 	cp -f config/rtsp.conf $(PKG_BIN)/usr/etc/facial-recognition/rtsp.conf
 	cp -f config/database.json $(PKG_BIN)/usr/etc/facial-recognition/database.json
 	if [ -f $(MODEL_SRC) ]; then cp -f $(MODEL_SRC) $(PKG_BIN)/usr/share/facial-recognition/model/yolov5n-face-rv1106.rknn; fi
@@ -74,7 +71,7 @@ all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(DETECTO
 	fi
 
 $(WEB_BIN): $(WEB_SRCS)
-	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi $(MEDIA_INCS) $^ -o $@ $(MEDIA_LIBS)
+	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi -I$(RKNN_PATH)/include -Isrc $^ -o $@ -L$(RKNN_PATH)/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath-link,$(RKNN_PATH)/lib -lrknnmrt -lcrypt -lpthread
 
 $(MEDIA_BIN): $(MEDIA_SRCS)
 	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi $(MEDIA_INCS) $(MEDIA_DEFS) $^ -o $@ $(MEDIA_LIBS)
@@ -85,11 +82,8 @@ $(RKNN_INSPECT_BIN): $(RKNN_INSPECT_SRC)
 $(RKNN_BENCHMARK_BIN): $(RKNN_BENCHMARK_SRC)
 	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi -I$(RKNN_PATH)/include $< -o $@ -L$(RKNN_PATH)/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath-link,$(RKNN_PATH)/lib -lrknnmrt
 
-$(DETECTOR_VERIFY_BIN): $(DETECTOR_VERIFY_SRC)
-	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi -Isrc -I$(RKNN_PATH)/include $^ -o $@ -L$(RKNN_PATH)/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath-link,$(RKNN_PATH)/lib -lrknnmrt -lpthread
-
 clean:
-	rm -rf $(PKG_BIN) $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(DETECTOR_VERIFY_BIN)
+	rm -rf $(PKG_BIN) $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN)
 
 info:
 	@echo "Facial Recognition: SC3336 runtime AI recognition package"

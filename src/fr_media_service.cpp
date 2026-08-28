@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/poll.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -71,6 +72,21 @@ static rk_aiq_sys_ctx_t *g_aiq_ctx[3] = {NULL, NULL, NULL};
 const char* kStateFile = "/tmp/fr_ai_state.json";
 const char* kEnrollReq = "/tmp/fr_ai_enroll_req.json";
 const char* kEnrollRes = "/tmp/fr_ai_enroll_res.json";
+
+// ---- SD-card segment recording (single VENC stream fan-out) ----
+// The RTSP thread is the only VENC consumer, so the recorder rides the same
+// loop (mirror of the SDK dashcam StreamLoop pattern, written local to this
+// component).  A segment opens only after a RequestIDR produces a decodable
+// start (VPS/SPS/PPS for H.265, SPS/PPS for H.264, plus the IDR NAL), is
+// written to a hidden ".tmp" file, fsync'd and renamed on close.  When no SD
+// is present the recorder transitions to WAITING_FOR_SD and retries later;
+// recording never blocks RTSP or the AI worker.
+static const char* kDefaultRecordDir = "/mnt/sdcard/DCIM/ai";
+static volatile bool g_record_enabled = true;
+static bool g_record_force_dir = false;
+static int g_segment_seconds = 180;
+static std::string g_record_dir = kDefaultRecordDir;
+static RK_CODEC_ID_E g_venc_codec = RK_VIDEO_ID_AVC;
 
 void SigtermHandler(int sig) {
     std::fprintf(stderr, "Received signal %d, stopping...\n", sig);
@@ -257,6 +273,279 @@ void OsdUpdateStatus(int faces, int enrolled, double fps, bool matched,
     }
 }
 
+// ---- SD-card recording helpers ----
+
+// UTC+7 wall clock used for recorder filenames (dashcam VietnamTimestamp
+// convention; no tzset dependency).
+std::string VietnamTimestamp(time_t t) {
+    t += 7 * 3600;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d", tmv.tm_year + 1900,
+             tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return buf;
+}
+
+// Detect a random-access NAL start code in the encoded packet and the codec
+// parameter sets required before a segment can be opened.  H.265 needs
+// VPS(32)/SPS(33)/PPS(34) + IDR(16..21); H.264 needs SPS(7)/PPS(8) + IDR(5).
+struct NalStartInfo {
+    bool vps = false;
+    bool sps = false;
+    bool pps = false;
+    bool idr = false;
+};
+
+NalStartInfo ScanNalStart(const uint8_t* data, size_t size, bool hevc) {
+    NalStartInfo info;
+    for (size_t i = 0; i + 4 < size && !info.idr; ++i) {
+        size_t header = 0;
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            header = i + 3;
+        } else if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
+                   data[i + 3] == 1) {
+            header = i + 4;
+        } else {
+            continue;
+        }
+        if (header >= size) continue;
+        if (hevc) {
+            const unsigned type = (data[header] >> 1) & 0x3f;
+            info.vps |= type == 32;
+            info.sps |= type == 33;
+            info.pps |= type == 34;
+            info.idr |= type >= 16 && type <= 21;
+        } else {
+            const unsigned type = data[header] & 0x1f;
+            info.sps |= type == 7;
+            info.pps |= type == 8;
+            info.idr |= type == 5;
+        }
+    }
+    return info;
+}
+
+bool IsStartPacket(const uint8_t* data, size_t size, RK_CODEC_ID_E codec) {
+    if (!data || size == 0) return false;
+    const bool hevc = codec == RK_VIDEO_ID_HEVC;
+    const NalStartInfo info = ScanNalStart(data, size, hevc);
+    if (hevc) return info.vps && info.sps && info.pps && info.idr;
+    return info.sps && info.pps && info.idr;
+}
+
+bool SdAvailable() {
+    // An explicit -R dir (or FR_RECORD_DIR) bypasses the removable-SD check
+    // so the feature can be exercised on tmpfs/rootfs during bring-up.  The
+    // default target remains a real /dev/mmcblk* partition mounted at
+    // /mnt/sdcard.
+    if (g_record_force_dir) {
+        // The target dir may not exist yet (created in EnsureOpen).  Accept it
+        // when the dir itself or its nearest existing ancestor is writable.
+        struct stat st;
+        const std::string& d = g_record_dir;
+        if (stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            return access(d.c_str(), R_OK | W_OK) == 0;
+        const size_t slash = d.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            const std::string parent = d.substr(0, slash);
+            if (stat(parent.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                return access(parent.c_str(), R_OK | W_OK) == 0;
+        }
+        return false;
+    }
+
+    // Only a real removable SD partition qualifies.  A plain directory under
+    // the 154 MiB rootfs (e.g. an empty /mnt/sdcard on first boot) would be
+    // silently filled and is explicitly rejected.
+    struct stat st;
+    if (stat("/mnt/sdcard", &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    if (access("/mnt/sdcard", R_OK | W_OK) != 0) return false;
+
+    FILE* mounts = fopen("/proc/mounts", "r");
+    if (!mounts) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), mounts)) {
+        char source[128] = {0}, target[128] = {0}, fstype[32] = {0};
+        if (sscanf(line, "%127s %127s %31s", source, target, fstype) == 3 &&
+            strcmp(target, "/mnt/sdcard") == 0 &&
+            strncmp(source, "/dev/mmcblk", 11) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(mounts);
+    return found;
+}
+
+static uint64_t SegMonotonicSec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec);
+}
+
+class SegmentRecorder {
+public:
+    SegmentRecorder() = default;
+
+    bool NeedsStart() const { return fd_ < 0; }
+    bool IsOpen() const { return fd_ >= 0; }
+
+    void Close() {
+        if (fd_ < 0) return;
+        fsync(fd_);
+        close(fd_);
+        fd_ = -1;
+        const std::string final_path = segment_dir_ + "/" + prefix_ +
+                                       VietnamTimestamp(segment_start_utc_) + ext_;
+        if (bytes_written_ > 0 && rename(temp_path_.c_str(), final_path.c_str()) == 0) {
+            std::printf("[REC] state=SEGMENT_CLOSED path=%s bytes=%zu\n",
+                        final_path.c_str(), bytes_written_);
+        } else {
+            unlink(temp_path_.c_str());
+            std::printf("[REC] state=DROP_EMPTY_OR_RENAME_FAILED temp=%s bytes=%zu\n",
+                        temp_path_.c_str(), bytes_written_);
+        }
+        segment_start_utc_ = time(nullptr);
+        temp_path_.clear();
+        bytes_written_ = 0;
+    }
+
+    bool Write(const uint8_t* data, size_t size) {
+        if (!g_record_enabled) return false;
+        if (!SdAvailable()) {
+            if (!sd_waiting_logged_) {
+                std::printf("[REC] state=WAITING_FOR_SD\n");
+                sd_waiting_logged_ = true;
+            }
+            if (fd_ >= 0) Close();
+            return false;
+        }
+        sd_waiting_logged_ = false;
+        if (!EnsureOpen()) return false;
+
+        size_t written = 0;
+        while (written < size) {
+            const ssize_t rc = write(fd_, data + written, size - written);
+            if (rc <= 0) {
+                std::printf("[REC] write failed errno=%d\n", errno);
+                Close();
+                return false;
+            }
+            written += static_cast<size_t>(rc);
+        }
+        bytes_written_ += size;
+        if (SegMonotonicSec() - opened_monotonic_ >=
+            static_cast<uint64_t>(g_segment_seconds)) {
+            Close();
+        }
+        return true;
+    }
+
+    std::string Directory() const { return segment_dir_; }
+
+private:
+    // Daemon must survive a full disk: refuse to open a new segment when
+    // free space is too low instead of exhausting storage (or RAM-backed
+    // tmpfs during tests) one doomed segment at a time.
+    bool StorageOkToStart() {
+        struct statvfs vfs;
+        std::string probe = g_record_dir;
+        if (statvfs(probe.c_str(), &vfs) != 0) {
+            const size_t slash = probe.find_last_of('/');
+            if (slash != std::string::npos && slash > 0) {
+                probe = probe.substr(0, slash);
+                if (statvfs(probe.c_str(), &vfs) != 0) return false;
+            } else {
+                return false;
+            }
+        }
+        const uint64_t free_bytes =
+            static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+        const uint64_t min_needed =
+            static_cast<uint64_t>(g_segment_seconds) * (g_u32Bitrate / 8) * 1024;
+        const uint64_t min_needed_lo = 8 * 1024 * 1024;
+        if (free_bytes < std::max<uint64_t>(min_needed, min_needed_lo)) {
+            KeepaliveLog(("[REC] LOW_STORAGE free=" +
+                          std::to_string(free_bytes / (1024 * 1024)) +
+                          "MB need_min=" +
+                          std::to_string(
+                              std::max<uint64_t>(min_needed, min_needed_lo) /
+                              (1024 * 1024)) + "MB").c_str());
+            return false;
+        }
+        return true;
+    }
+    // Recursively create dir (and missing ancestors) up to the mount point.
+    bool MkdirRecursive(const char* path) {
+        if (mkdir(path, 0755) == 0) return true;
+        if (errno == EEXIST) return true;
+        if (errno != ENOENT) {
+            KeepaliveLog(("[REC] mkdir failed dir=" + std::string(path) +
+                          " errno=" + std::to_string(errno)).c_str());
+            return false;
+        }
+        const char* slash = strrchr(path, '/');
+        if (!slash || slash == path) return false;
+        std::string parent(path, static_cast<size_t>(slash - path));
+        if (!MkdirRecursive(parent.c_str())) return false;
+        if (mkdir(path, 0755) == 0 || errno == EEXIST) return true;
+        KeepaliveLog(("[REC] mkdir retry failed dir=" + std::string(path) +
+                      " errno=" + std::to_string(errno)).c_str());
+        return false;
+    }
+
+    bool EnsureOpen() {
+        if (fd_ >= 0) return true;
+        if (g_record_dir.empty()) return false;
+        if (!StorageOkToStart()) return false;
+
+        const time_t now = time(nullptr);
+        const std::string ts = VietnamTimestamp(now);
+        const std::string date_dir = g_record_dir + "/" + ts.substr(0, 8);
+        if (!MkdirRecursive(date_dir.c_str())) return false;
+        segment_dir_ = date_dir;
+        segment_start_utc_ = now;
+        opened_monotonic_ = SegMonotonicSec();
+        prefix_ = "ai_";
+        if (g_venc_codec == RK_VIDEO_ID_HEVC) {
+            ext_ = ".h265";
+        } else {
+            ext_ = ".h264";
+        }
+        temp_path_ = segment_dir_ + "/." + prefix_ + "pending_" +
+                     std::to_string(opened_monotonic_) + ext_ + ".tmp";
+        fd_ = open(temp_path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd_ < 0) {
+            std::printf("[REC] open failed errno=%d\n", errno);
+            return false;
+        }
+        bytes_written_ = 0;
+        std::printf("[REC] state=RECORDING temp=%s\n", temp_path_.c_str());
+        return true;
+    }
+
+int fd_ = -1;
+    uint64_t opened_monotonic_ = 0;
+    time_t segment_start_utc_ = 0;
+    size_t bytes_written_ = 0;
+    bool sd_waiting_logged_ = false;
+    uint64_t last_fail_log_ms_ = 0;
+    std::string ext_ = ".h264";
+    std::string prefix_ = "ai_";
+    std::string temp_path_;
+    std::string segment_dir_;
+
+    // Rate-limit repeated failure logs (e.g. missing SD) to one line every 5s.
+    void KeepaliveLog(const char* msg) {
+        const uint64_t ms = MonotonicMs();
+        if (ms - last_fail_log_ms_ < 5000) return;
+        last_fail_log_ms_ = ms;
+        std::printf("%s\n", msg);
+    }
+};
+
 #ifdef RKAIQ
 RK_S32 SimpleCommIspInit(RK_S32 CamId, rk_aiq_working_mode_t WDRMode, RK_BOOL MultiCam, const char *iq_file_dir) {
     (void)MultiCam;
@@ -419,17 +708,52 @@ void* RtspStreamingThread(void* /*arg*/) {
     memset(&stFrame, 0, sizeof(VENC_STREAM_S));
     stFrame.pstPack = reinterpret_cast<VENC_PACK_S*>(std::malloc(sizeof(VENC_PACK_S)));
 
+    SegmentRecorder recorder;
+    bool idr_requested = false;
+    bool sd_wait_logged = false;
+
     while (!g_quit) {
         int s32Ret = RK_MPI_VENC_GetStream(0, &stFrame, 1000);
         if (s32Ret == RK_SUCCESS) {
             void* data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+            const size_t len = stFrame.pstPack->u32Len;
+
+            // SD recording on the same VENC loop (single consumer).
+            if (g_record_enabled && bytes && len > 0) {
+                if (recorder.NeedsStart() && !idr_requested) {
+                    if (SdAvailable()) {
+                        const int idr_rc = RK_MPI_VENC_RequestIDR(0, RK_TRUE);
+                        idr_requested = (idr_rc == RK_SUCCESS);
+                        if (idr_requested) {
+                            std::printf("[REC] state=REQUEST_IDR\n");
+                        }
+                        sd_wait_logged = false;
+                    } else if (!sd_wait_logged) {
+                        std::printf("[REC] state=WAITING_FOR_SD\n");
+                        sd_wait_logged = true;
+                    }
+                }
+                const bool start = IsStartPacket(bytes, len, g_venc_codec);
+                if ((!recorder.NeedsStart() || start) &&
+                    recorder.Write(bytes, len)) {
+                    sd_wait_logged = false;
+                    if (recorder.NeedsStart() || idr_requested) {
+                        idr_requested = false;
+                    }
+                }
+            } else if (recorder.IsOpen()) {
+                recorder.Close();
+            }
+
             if (g_rtsp_session) {
-                rtsp_tx_video(g_rtsp_session, reinterpret_cast<uint8_t*>(data), stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
+                rtsp_tx_video(g_rtsp_session, bytes, len, stFrame.pstPack->u64PTS);
                 rtsp_do_event(g_rtsplive);
             }
             RK_MPI_VENC_ReleaseStream(0, &stFrame);
         }
     }
+    if (recorder.IsOpen()) recorder.Close();
     if (stFrame.pstPack) {
         std::free(stFrame.pstPack);
     }
@@ -509,6 +833,12 @@ void* AiWorkerThread(void* arg) {
     fr::FaceDatabase db(args->db_path);
     fr::FaceRecognizer recognizer;
 
+    time_t last_db_mtime = 0;
+    struct stat db_st;
+    if (stat(args->db_path.c_str(), &db_st) == 0) {
+        last_db_mtime = db_st.st_mtime;
+    }
+
     std::vector<uint8_t> rgb_640(640 * 640 * 3, 0);
     uint64_t frame_count = 0;
     uint64_t last_fps_time = MonotonicMs();
@@ -525,6 +855,13 @@ void* AiWorkerThread(void* arg) {
 
     while (!g_quit) {
         uint64_t loop_start = MonotonicMs();
+
+        // 0. Auto-reload database if modified externally (e.g. deleted or added via WebConfig)
+        if (stat(args->db_path.c_str(), &db_st) == 0 && db_st.st_mtime != last_db_mtime) {
+            last_db_mtime = db_st.st_mtime;
+            db.Load(args->db_path);
+            std::printf("[AI] Database file modified externally. Reloaded %zu enrolled persons.\n", db.Count());
+        }
 
         // 1. Check for Enrollment Request from WebConfig
         bool has_enroll_req = false;
@@ -596,6 +933,7 @@ void* AiWorkerThread(void* arg) {
                 std::ostringstream res_ss;
                 std::string assigned_id;
                 if (db.AddPerson(enroll_pending_name, enroll_samples, &assigned_id)) {
+                    if (stat(args->db_path.c_str(), &db_st) == 0) last_db_mtime = db_st.st_mtime;
                     res_ss << "{\"success\":true,\"name\":\"" << enroll_pending_name
                            << "\",\"id\":\"" << assigned_id
                            << "\",\"samples\":" << enroll_samples.size() << "}";
@@ -693,7 +1031,7 @@ int main(int argc, char* argv[]) {
     std::string db_path = "/oem/usr/etc/facial-recognition/database.json";
 
     int opt;
-    while ((opt = getopt(argc, argv, "w:h:b:e:a:m:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "w:h:b:e:a:m:d:R:T:N")) != -1) {
         switch (opt) {
             case 'w': width = std::atoi(optarg); break;
             case 'h': height = std::atoi(optarg); break;
@@ -705,9 +1043,28 @@ int main(int argc, char* argv[]) {
             case 'a': iq_dir = optarg; break;
             case 'm': model_path = optarg; break;
             case 'd': db_path = optarg; break;
+            case 'R':
+                g_record_dir = optarg;
+                g_record_force_dir = true;
+                break;
+            case 'T':
+                g_segment_seconds = std::max(10, std::atoi(optarg));
+                break;
+            case 'N': g_record_enabled = false; break;
             default: break;
         }
     }
+    g_venc_codec = codec;
+    if (const char* env_dir = getenv("FR_RECORD_DIR")) {
+        // DEBUG: exercise recording on a plain directory (used for tmpfs
+        // bring-up; the production default still requires a real SD mount).
+        g_record_dir = env_dir;
+        g_record_force_dir = true;
+    }
+    std::printf("[REC] recording=%s dir=%s segment_seconds=%d codec=%s\n",
+                g_record_enabled ? "enabled" : "disabled", g_record_dir.c_str(),
+                g_segment_seconds,
+                codec == RK_VIDEO_ID_HEVC ? "H265" : "H264");
 
     signal(SIGINT, SigtermHandler);
     signal(SIGTERM, SigtermHandler);

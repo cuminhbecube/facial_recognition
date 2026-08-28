@@ -13,3 +13,4 @@ config/database.json
 *.o
 *.a
 *.so
+fr-detector-verify
