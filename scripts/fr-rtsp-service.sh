@@ -15,7 +15,7 @@ DB_PATH=/oem/usr/etc/facial-recognition/database.json
 WIDTH=2304
 HEIGHT=1296
 BITRATE_KBPS=4096
-CODEC=h264
+CODEC=h265
 
 if [ -r "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
