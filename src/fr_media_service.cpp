@@ -385,6 +385,26 @@ static uint64_t SegMonotonicSec() {
     return static_cast<uint64_t>(ts.tv_sec);
 }
 
+// Publishes current recording state so WebConfig/API clients can display it
+// without parsing the log (mirrors /tmp/fr_ai_state.json).
+static void NotifyRecordState(const char* state, const std::string& detail = "") {
+    std::ostringstream json;
+    json << "{\"recording_enabled\":"
+         << (g_record_enabled ? "true" : "false")
+         << ",\"state\":" << (state ? std::string("\"") + state + "\"" : std::string("null"))
+         << ",\"detail\":" << "\"" << detail << "\""
+         << ",\"dir\":" << "\"" << g_record_dir << "\""
+         << ",\"segment_seconds\":" << g_segment_seconds
+         << ",\"codec\":" << (g_venc_codec == RK_VIDEO_ID_HEVC ? "\"h265\"" : "\"h264\"")
+         << ",\"sd_available\":" << (SdAvailable() ? "true" : "false")
+         << ",\"timestamp\":" << static_cast<long long>(time(nullptr)) << "}\n";
+    FILE* state_file = std::fopen("/tmp/fr_record_state.json", "w");
+    if (state_file) {
+        std::fputs(json.str().c_str(), state_file);
+        std::fclose(state_file);
+    }
+}
+
 class SegmentRecorder {
 public:
     SegmentRecorder() = default;
@@ -402,10 +422,12 @@ public:
         if (bytes_written_ > 0 && rename(temp_path_.c_str(), final_path.c_str()) == 0) {
             std::printf("[REC] state=SEGMENT_CLOSED path=%s bytes=%zu\n",
                         final_path.c_str(), bytes_written_);
+            NotifyRecordState("SEGMENT_CLOSED", final_path);
         } else {
             unlink(temp_path_.c_str());
             std::printf("[REC] state=DROP_EMPTY_OR_RENAME_FAILED temp=%s bytes=%zu\n",
                         temp_path_.c_str(), bytes_written_);
+            NotifyRecordState("DROP_EMPTY_OR_RENAME_FAILED");
         }
         segment_start_utc_ = time(nullptr);
         temp_path_.clear();
@@ -417,6 +439,7 @@ public:
         if (!SdAvailable()) {
             if (!sd_waiting_logged_) {
                 std::printf("[REC] state=WAITING_FOR_SD\n");
+                NotifyRecordState("WAITING_FOR_SD");
                 sd_waiting_logged_ = true;
             }
             if (fd_ >= 0) Close();
@@ -473,6 +496,7 @@ private:
                           std::to_string(
                               std::max<uint64_t>(min_needed, min_needed_lo) /
                               (1024 * 1024)) + "MB").c_str());
+            NotifyRecordState("LOW_STORAGE");
             return false;
         }
         return true;
@@ -523,6 +547,7 @@ private:
         }
         bytes_written_ = 0;
         std::printf("[REC] state=RECORDING temp=%s\n", temp_path_.c_str());
+        NotifyRecordState("RECORDING", temp_path_);
         return true;
     }
 
@@ -727,10 +752,12 @@ void* RtspStreamingThread(void* /*arg*/) {
                         idr_requested = (idr_rc == RK_SUCCESS);
                         if (idr_requested) {
                             std::printf("[REC] state=REQUEST_IDR\n");
+                            NotifyRecordState("REQUEST_IDR");
                         }
                         sd_wait_logged = false;
                     } else if (!sd_wait_logged) {
                         std::printf("[REC] state=WAITING_FOR_SD\n");
+                        NotifyRecordState("WAITING_FOR_SD");
                         sd_wait_logged = true;
                     }
                 }
@@ -1065,6 +1092,7 @@ int main(int argc, char* argv[]) {
                 g_record_enabled ? "enabled" : "disabled", g_record_dir.c_str(),
                 g_segment_seconds,
                 codec == RK_VIDEO_ID_HEVC ? "H265" : "H264");
+    NotifyRecordState(g_record_enabled ? "INITIALIZING" : "DISABLED");
 
     signal(SIGINT, SigtermHandler);
     signal(SIGTERM, SigtermHandler);
