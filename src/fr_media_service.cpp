@@ -414,13 +414,16 @@ static bool SdMounted() {
     return found;
 }
 
-// Attach a removable FAT32 SD card at /mnt/sdcard as soon as the controller
+// Attach a removable SD card at /mnt/sdcard as soon as the controller
 // reports a card.  Runs as root so no external mdev/udev rule is required;
-// a missing/blank card simply keeps WAITING_FOR_SD.
+// a missing/blank card simply keeps WAITING_FOR_SD.  Tries vfat first for
+// FAT32 cards, then exfat so high-capacity (SDXC, e.g. 128 GB) cards used
+// out of the factory with exFAT format are accepted too.
 static bool AttachSd() {
     if (mkdir("/mnt/sdcard", 0755) != 0 && errno != EEXIST) return false;
     // Prefer partitions (mmcblkNpM), try each card in order, then its raw
     // whole-disk device as a fallback for superfloppy-format cards.
+    static const char* const kFsTypes[] = {"vfat", "exfat"};
     std::vector<std::string> candidates;
     DIR* d = opendir("/dev");
     if (d) {
@@ -441,9 +444,11 @@ static bool AttachSd() {
               });
     for (const std::string& dev : candidates) {
         if (SdMounted()) return true;
-        if (mount(dev.c_str(), "/mnt/sdcard", "vfat",
-                  MS_NOSUID | MS_NOEXEC | MS_RELATIME, nullptr) == 0)
-            return true;
+        for (const char* fs : kFsTypes) {
+            if (mount(dev.c_str(), "/mnt/sdcard", fs,
+                      MS_NOSUID | MS_NOEXEC | MS_RELATIME, nullptr) == 0)
+                return true;
+        }
     }
     return false;
 }
