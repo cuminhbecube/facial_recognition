@@ -10,12 +10,20 @@ MEDIA_BIN=/oem/usr/bin/fr-media-service
 IQ_DIR=/etc/iqfiles
 CONFIG_FILE=/oem/usr/etc/facial-recognition/rtsp.conf
 MODEL_PATH=/oem/usr/share/facial-recognition/model/yolov5n-face-rv1106.rknn
-DB_PATH=/oem/usr/etc/facial-recognition/database.json
+DB_PATH=/userdata/facial-recognition/database.json
+if [ ! -f "$DB_PATH" ] && [ -f /oem/usr/etc/facial-recognition/database.json ]; then
+    mkdir -p /userdata/facial-recognition
+    cp -f /oem/usr/etc/facial-recognition/database.json "$DB_PATH" 2>/dev/null || true
+fi
+if [ ! -f "$DB_PATH" ] && [ ! -d /userdata ]; then
+    DB_PATH=/oem/usr/etc/facial-recognition/database.json
+fi
 
 WIDTH=1920
 HEIGHT=1080
 BITRATE_KBPS=1024
 CODEC=h265
+SEGMENT_SECONDS=180
 
 if [ -r "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
@@ -42,7 +50,7 @@ start() {
     [ -d "$IQ_DIR" ] || return 1
 
     export LD_LIBRARY_PATH=/oem/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-    "$MEDIA_BIN" -w "$WIDTH" -h "$HEIGHT" -a "$IQ_DIR" -e "$CODEC" -b "$BITRATE_KBPS" -m "$MODEL_PATH" -d "$DB_PATH" >>"$LOG_FILE" 2>&1 &
+    "$MEDIA_BIN" -w "$WIDTH" -h "$HEIGHT" -a "$IQ_DIR" -e "$CODEC" -b "$BITRATE_KBPS" -T "$SEGMENT_SECONDS" -m "$MODEL_PATH" -d "$DB_PATH" >>"$LOG_FILE" 2>&1 &
     echo $! >"$PID_FILE"
 }
 

@@ -47,7 +47,7 @@ public:
     void SetDbPath(const std::string& path) { db_path_ = path; }
 
 private:
-    std::string db_path_{"/oem/usr/etc/facial-recognition/database.json"};
+    std::string db_path_{"/userdata/facial-recognition/database.json"};
     std::vector<PersonRecord> records_;
     mutable std::mutex mutex_;
 };

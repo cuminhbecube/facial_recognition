@@ -43,10 +43,12 @@ RKNN_INSPECT_BIN := fr-rknn-inspect
 RKNN_INSPECT_SRC := src/fr_rknn_inspect.cpp
 RKNN_BENCHMARK_BIN := fr-rknn-benchmark
 RKNN_BENCHMARK_SRC := src/fr_rknn_benchmark.cpp
+TEST_BIN := fr-test-suite
+TEST_SRCS := src/fr_test_suite.cpp src/fr_face_db.cpp src/fr_face_recognizer.cpp
 
-.PHONY: all clean info
+.PHONY: all clean info test
 
-all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN)
+all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(TEST_BIN)
 	mkdir -p $(PKG_BIN)/usr/bin $(PKG_BIN)/usr/share/facial-recognition/model $(PKG_BIN)/usr/etc/facial-recognition $(PKG_BIN)/root/etc/init.d
 	cp -f scripts/fr-camera-validate.sh $(PKG_BIN)/usr/bin/fr-camera-validate
 	cp -f scripts/fr-rtsp-service.sh $(PKG_BIN)/usr/bin/fr-rtsp-service
@@ -59,6 +61,7 @@ all: $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN)
 	cp -f $(MEDIA_BIN) $(PKG_BIN)/usr/bin/fr-ai-service
 	cp -f $(RKNN_INSPECT_BIN) $(PKG_BIN)/usr/bin/$(RKNN_INSPECT_BIN)
 	cp -f $(RKNN_BENCHMARK_BIN) $(PKG_BIN)/usr/bin/$(RKNN_BENCHMARK_BIN)
+	cp -f $(TEST_BIN) $(PKG_BIN)/usr/bin/$(TEST_BIN)
 	cp -f config/rtsp.conf $(PKG_BIN)/usr/etc/facial-recognition/rtsp.conf
 	cp -f config/database.json $(PKG_BIN)/usr/etc/facial-recognition/database.json
 	if [ -f $(MODEL_SRC) ]; then cp -f $(MODEL_SRC) $(PKG_BIN)/usr/share/facial-recognition/model/yolov5n-face-rv1106.rknn; fi
@@ -82,8 +85,19 @@ $(RKNN_INSPECT_BIN): $(RKNN_INSPECT_SRC)
 $(RKNN_BENCHMARK_BIN): $(RKNN_BENCHMARK_SRC)
 	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi -I$(RKNN_PATH)/include $< -o $@ -L$(RKNN_PATH)/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath-link,$(RKNN_PATH)/lib -lrknnmrt
 
+$(TEST_BIN): $(TEST_SRCS)
+	$(RK_APP_CROSS)-g++ $(RK_APP_CROSS_CFLAGS) -std=c++17 -Wall -Wextra -Werror -Wno-psabi -I$(RKNN_PATH)/include -Isrc $^ -o $@ -L$(RKNN_PATH)/lib -Wl,-rpath,/oem/usr/lib -Wl,-rpath-link,$(RKNN_PATH)/lib -lrknnmrt -lpthread
+
 clean:
-	rm -rf $(PKG_BIN) $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN)
+	rm -rf $(PKG_BIN) $(WEB_BIN) $(MEDIA_BIN) $(RKNN_INSPECT_BIN) $(RKNN_BENCHMARK_BIN) $(TEST_BIN) fr_test_suite_native fr_test_suite_asan
+
+test_native: $(TEST_SRCS)
+	g++ -std=c++17 -Wall -Wextra -I../capture_ai/3rdparty/rknpu2/include -Isrc $^ -o fr_test_suite_native -lpthread
+	./fr_test_suite_native 20
+
+test_asan: $(TEST_SRCS)
+	g++ -std=c++17 -Wall -Wextra -fsanitize=address,undefined -g -I../capture_ai/3rdparty/rknpu2/include -Isrc $^ -o fr_test_suite_asan -lpthread
+	./fr_test_suite_asan 20
 
 info:
 	@echo "Facial Recognition: SC3336 runtime AI recognition package"

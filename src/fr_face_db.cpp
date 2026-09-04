@@ -13,11 +13,16 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <sstream>
+#include <utility>
 
 namespace fr {
 
 namespace {
+
+constexpr const char* kUserdataDbPath =
+    "/userdata/facial-recognition/database.json";
 
 std::string EscapeJson(const std::string& str) {
     std::ostringstream ss;
@@ -57,6 +62,7 @@ std::string GenerateId(const std::string& /*name*/) {
 
 FaceFeature ParseFeatureArray(const std::string& f_str) {
     FaceFeature feat;
+    feat.data.clear();
     std::istringstream fss(f_str);
     std::string token;
     while (std::getline(fss, token, ',')) {
@@ -68,33 +74,45 @@ FaceFeature ParseFeatureArray(const std::string& f_str) {
     return feat;
 }
 
-}  // namespace
-
-FaceDatabase::FaceDatabase() = default;
-
-FaceDatabase::FaceDatabase(const std::string& db_path) : db_path_(db_path) {
-    Load(db_path_);
+static bool EnsureParentDir(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return true;
+    std::string dir = path.substr(0, slash);
+    std::string current;
+    std::istringstream ss(dir);
+    std::string part;
+    if (dir[0] == '/') current = "/";
+    while (std::getline(ss, part, '/')) {
+        if (part.empty()) continue;
+        current += part + "/";
+        mkdir(current.c_str(), 0755);
+    }
+    return true;
 }
 
-FaceDatabase::~FaceDatabase() = default;
-
-bool FaceDatabase::Load(const std::string& db_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_path.empty()) db_path_ = db_path;
-
-    records_.clear();
-
-    std::ifstream file(db_path_);
-    if (!file.is_open()) {
+static bool AtomicWriteFile(const std::string& target_path, const std::string& data) {
+    if (!EnsureParentDir(target_path)) return false;
+    std::string tmp_path = target_path + ".tmp";
+    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
         return false;
     }
+    ssize_t written = write(fd, data.data(), data.size());
+    fsync(fd);
+    close(fd);
+    if (written != static_cast<ssize_t>(data.size())) {
+        unlink(tmp_path.c_str());
+        return false;
+    }
+    if (rename(tmp_path.c_str(), target_path.c_str()) != 0) {
+        unlink(tmp_path.c_str());
+        return false;
+    }
+    return true;
+}
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
-    file.close();
-
-    // Simple custom JSON parser for database format
-    // Format: {"version":1,"persons":[{"id":"...","name":"...","created_at":123,"feature":[...]}, ...]}
+static bool ParseDbContent(const std::string& content, std::vector<PersonRecord>& out_records) {
+    out_records.clear();
     size_t persons_pos = content.find("\"persons\"");
     if (persons_pos == std::string::npos) return true;
 
@@ -110,7 +128,6 @@ bool FaceDatabase::Load(const std::string& db_path) {
         if (obj_end == std::string::npos) break;
 
         std::string obj_str = content.substr(obj_start, obj_end - obj_start + 1);
-
         PersonRecord rec;
 
         // Parse id
@@ -146,22 +163,21 @@ bool FaceDatabase::Load(const std::string& db_path) {
             }
         }
 
-        // Parse "features" array-of-arrays (new multi-sample format)
+        // Parse "features" array-of-arrays
         size_t feats_key = obj_str.find("\"features\"");
         if (feats_key != std::string::npos) {
             size_t f_arr_start = obj_str.find('[', feats_key);
-            // Find the opening [ after the key, then iterate nested arrays
             if (f_arr_start != std::string::npos) {
                 std::string inner = obj_str.substr(f_arr_start + 1);
-                size_t pos = 0;
-                while (pos < inner.size()) {
-                    size_t sub_start = inner.find('[', pos);
+                size_t p = 0;
+                while (p < inner.size()) {
+                    size_t sub_start = inner.find('[', p);
                     if (sub_start == std::string::npos) break;
                     size_t sub_end = inner.find(']', sub_start);
                     if (sub_end == std::string::npos) break;
                     rec.features.push_back(ParseFeatureArray(
                         inner.substr(sub_start + 1, sub_end - sub_start - 1)));
-                    pos = sub_end + 1;
+                    p = sub_end + 1;
                 }
             }
         }
@@ -181,25 +197,23 @@ bool FaceDatabase::Load(const std::string& db_path) {
 
         if (!rec.name.empty() && !rec.features.empty()) {
             if (rec.id.empty()) rec.id = GenerateId(rec.name);
-            records_.push_back(rec);
+            out_records.push_back(rec);
         }
 
         pos = obj_end + 1;
     }
-
-    std::printf("[FaceDatabase] Loaded %zu persons from %s\n", records_.size(), db_path_.c_str());
     return true;
 }
 
-bool FaceDatabase::Save(const std::string& db_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_path.empty()) db_path_ = db_path;
-
+// Serialize persons to the on-disk JSON format. Shared by Save() and by the
+// migration that re-homes the active DB onto the persistent /userdata volume.
+std::string BuildPersonsJson(const std::vector<PersonRecord>& records) {
     std::ostringstream json;
-    json << "{\n  \"version\": 1,\n  \"count\": " << records_.size() << ",\n  \"persons\": [\n";
+    json << "{\n  \"version\": 1,\n  \"count\": " << records.size()
+         << ",\n  \"persons\": [\n";
 
-    for (size_t i = 0; i < records_.size(); ++i) {
-        const auto& rec = records_[i];
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto& rec = records[i];
         json << "    {\n"
              << "      \"id\": \"" << EscapeJson(rec.id) << "\",\n"
              << "      \"name\": \"" << EscapeJson(rec.name) << "\",\n"
@@ -216,35 +230,140 @@ bool FaceDatabase::Save(const std::string& db_path) {
             }
             json << "]";
         }
-        json << "]\n    }" << (i + 1 < records_.size() ? "," : "") << "\n";
+        json << "]\n    }" << (i + 1 < records.size() ? "," : "") << "\n";
     }
     json << "  ]\n}\n";
+    return json.str();
+}
 
-    std::string json_str = json.str();
-    std::string tmp_path = db_path_ + ".tmp";
+}  // namespace
 
-    // Atomic write
-    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        std::fprintf(stderr, "[FaceDatabase] Failed to open temp file for writing: %s\n", tmp_path.c_str());
-        return false;
+FaceDatabase::FaceDatabase() = default;
+
+FaceDatabase::FaceDatabase(const std::string& db_path) : db_path_(db_path) {
+    Load(db_path_);
+}
+
+FaceDatabase::~FaceDatabase() = default;
+
+bool FaceDatabase::Load(const std::string& db_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_path.empty()) db_path_ = db_path;
+
+    records_.clear();
+
+    std::vector<std::string> candidate_paths = {
+        db_path_,
+        "/userdata/facial-recognition/database.json",
+        "/oem/usr/etc/facial-recognition/database.json",
+        "/data/facial-recognition/database.json",
+        "config/database.json",
+        "/tmp/database.json"
+    };
+
+    // Merge every readable copy instead of first-file-wins. A stale shadow
+    // copy previously masked the live store, so enrolled faces appeared to be
+    // "forgotten" after reboots. Same-id duplicates are deduplicated, keeping
+    // the instance with the most samples.
+    std::vector<PersonRecord> merged;
+    std::map<std::string, size_t> index_by_id;
+    std::string first_loaded;
+
+    for (const auto& path : candidate_paths) {
+        if (path.empty() || access(path.c_str(), R_OK) != 0) continue;
+
+        std::ifstream file(path);
+        if (!file.is_open()) continue;
+
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+
+        std::vector<PersonRecord> parsed;
+        if (!ParseDbContent(content, parsed)) continue;
+        if (first_loaded.empty()) first_loaded = path;
+
+        for (auto& rec : parsed) {
+            auto it = index_by_id.find(rec.id);
+            if (it == index_by_id.end()) {
+                index_by_id.emplace(rec.id, merged.size());
+                merged.push_back(std::move(rec));
+                continue;
+            }
+            PersonRecord& cur = merged[it->second];
+            if (rec.features.size() > cur.features.size()) {
+                cur.features = std::move(rec.features);
+                if (rec.created_at) cur.created_at = rec.created_at;
+                if (!rec.name.empty()) cur.name = rec.name;
+            }
+        }
     }
 
-    ssize_t written = write(fd, json_str.data(), json_str.size());
-    fsync(fd);
-    close(fd);
+    if (!first_loaded.empty() || !merged.empty()) {
+        records_ = std::move(merged);
+        db_path_ = first_loaded.empty() ? db_path_ : first_loaded;
 
-    if (written != static_cast<ssize_t>(json_str.size())) {
-        unlink(tmp_path.c_str());
-        return false;
-    }
-
-    if (rename(tmp_path.c_str(), db_path_.c_str()) != 0) {
-        unlink(tmp_path.c_str());
-        return false;
+        // Re-home to the persistent writable volume so later enrollments never
+        // target the reflashable firmware partition (which would also make
+        // faces vanish on the next update).
+        if (db_path_ != kUserdataDbPath && access("/userdata", W_OK) == 0) {
+            AtomicWriteFile(kUserdataDbPath, BuildPersonsJson(records_));
+            db_path_ = kUserdataDbPath;
+        }
+        std::printf("[FaceDatabase] Loaded %zu persons from %s\n",
+                    records_.size(), db_path_.c_str());
+    } else {
+        records_.clear();
+        db_path_ = kUserdataDbPath;
+        if (access("/userdata", W_OK) == 0) {
+            AtomicWriteFile(kUserdataDbPath, BuildPersonsJson(records_));
+        }
+        std::printf("[FaceDatabase] No existing database found at %s. Initialized empty.\n",
+                    db_path_.c_str());
     }
 
     return true;
+}
+
+bool FaceDatabase::Save(const std::string& db_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_path.empty()) db_path_ = db_path;
+
+    const std::string json_str = BuildPersonsJson(records_);
+
+    // Primary write
+    bool ok = AtomicWriteFile(db_path_, json_str);
+
+    // If primary failed (e.g. read-only filesystem on /oem), fallback to writable persistent path
+    if (!ok) {
+        std::vector<std::string> fallbacks = {
+            kUserdataDbPath,
+            "/data/facial-recognition/database.json",
+            "/tmp/database.json"
+        };
+        for (const auto& fb : fallbacks) {
+            if (fb == db_path_) continue;
+            if (AtomicWriteFile(fb, json_str)) {
+                std::printf("[FaceDatabase] Primary save failed for %s. Fallback saved to %s\n",
+                            db_path_.c_str(), fb.c_str());
+                db_path_ = fb;
+                ok = true;
+                break;
+            }
+        }
+    } else {
+        // Also mirror to persistent /userdata if primary was /oem
+        if (db_path_ != kUserdataDbPath &&
+            (access("/userdata", W_OK) == 0 || access("/data", W_OK) == 0)) {
+            AtomicWriteFile(kUserdataDbPath, json_str);
+        }
+    }
+
+    if (!ok) {
+        std::fprintf(stderr, "[FaceDatabase] CRITICAL: Failed to save database to any persistent path!\n");
+    }
+
+    return ok;
 }
 
 bool FaceDatabase::AddPerson(const std::string& name, const std::vector<FaceFeature>& features, std::string* out_id) {

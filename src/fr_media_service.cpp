@@ -90,6 +90,42 @@ static int g_segment_seconds = 180;
 static std::string g_record_dir = kDefaultRecordDir;
 static RK_CODEC_ID_E g_venc_codec = RK_VIDEO_ID_AVC;
 
+static void RecoverPendingSegments(const std::string& root) {
+    static bool recovered_once = false;
+    if (recovered_once || root.empty()) return;
+    recovered_once = true;
+
+    DIR* d = opendir(root.c_str());
+    if (!d) return;
+
+    for (dirent* entry = nullptr; (entry = readdir(d)) != nullptr;) {
+        std::string date_folder = entry->d_name;
+        if (date_folder.size() != 8) continue;
+        std::string full_dir = root + "/" + date_folder;
+        DIR* sub = opendir(full_dir.c_str());
+        if (!sub) continue;
+
+        for (dirent* sub_entry = nullptr; (sub_entry = readdir(sub)) != nullptr;) {
+            std::string sub_name = sub_entry->d_name;
+            if (sub_name.rfind(".ai_pending_", 0) == 0 && sub_name.find(".tmp") != std::string::npos) {
+                std::string old_path = full_dir + "/" + sub_name;
+                struct stat st;
+                if (stat(old_path.c_str(), &st) == 0 && st.st_size > 65536) {
+                    std::string new_name = "ai_" + date_folder + "_rec_" + std::to_string(static_cast<long long>(st.st_mtime % 100000)) +
+                                           (sub_name.find(".h265") != std::string::npos ? ".h265" : ".h264");
+                    std::string new_path = full_dir + "/" + new_name;
+                    rename(old_path.c_str(), new_path.c_str());
+                    std::printf("[REC] Recovered unclosed segment: %s -> %s\n", old_path.c_str(), new_path.c_str());
+                } else {
+                    unlink(old_path.c_str());
+                }
+            }
+        }
+        closedir(sub);
+    }
+    closedir(d);
+}
+
 void SigtermHandler(int sig) {
     std::fprintf(stderr, "Received signal %d, stopping...\n", sig);
     g_quit = true;
@@ -660,18 +696,30 @@ private:
     bool EnsureOpen() {
         if (fd_ >= 0) return true;
         if (g_record_dir.empty()) return false;
-        // System clock at boot may briefly read 1970 until the ISP license /
-        // NTP sync lands; refuse to open under a bogus "19700101" directory.
-        const time_t now = time(nullptr);
+        
+        time_t now = time(nullptr);
         if (now < 1577836800LL) {
+            // Clock not yet synced via NTP: wait instead of recording under a
+            // plausible-looking but wrong date. A fixed playback epoch base
+            // produced bogus folder names (e.g. 20260303) that the UI/date
+            // sort treats as valid, which is exactly the "cannot see new
+            // videos" symptom. Once NTP syncs (seconds on this board) the
+            // recorder starts a correct segment.
             if (!clock_warned_) {
-                KeepaliveLog("[REC] waiting for wall-clock sync");
+                std::printf("[REC] state=CLOCK_WAIT clock unsynced now=%lld\n",
+                            static_cast<long long>(now));
+                NotifyRecordState("CLOCK_WAIT");
                 clock_warned_ = true;
             }
             return false;
         }
-        clock_warned_ = false;
+        if (clock_warned_) {
+            std::printf("[REC] clock synced, resuming segments\n");
+            clock_warned_ = false;
+        }
         if (!StorageOkToStart()) return false;
+
+        RecoverPendingSegments(g_record_dir);
 
         const std::string ts = VietnamTimestamp(now);
         const std::string date_dir = g_record_dir + "/" + ts.substr(0, 8);
@@ -1035,8 +1083,8 @@ void* AiWorkerThread(void* arg) {
     double current_fps = 0.0;
 
     // Multi-sample enrollment state: collect a person's embedding from
-    // several live frames (different poses/lighting) before adding to DB.
-    const int kEnrollSamples = 6;
+    // live frames before adding to DB (3 high quality samples).
+    const int kEnrollSamples = 3;
     bool enroll_collecting = false;
     std::string enroll_pending_name;
     std::vector<fr::FaceFeature> enroll_samples;
@@ -1156,7 +1204,7 @@ void* AiWorkerThread(void* arg) {
             fr::FaceFeature feat;
             fr::MatchResult match;
             if (recognizer.ExtractFeature(rgb_640.data(), 640, 640, face, feat)) {
-                match = db.FindMatch(feat, 0.70f);
+                match = db.FindMatch(feat, 0.48f);
             }
             osd_name = match.name;
             osd_sim = match.similarity;
@@ -1164,8 +1212,8 @@ void* AiWorkerThread(void* arg) {
 
             state_ss << "  \"current_person\": {\n";
             state_ss << "    \"matched\": " << (match.matched ? "true" : "false") << ",\n";
-            state_ss << "    \"name\": \"" << match.name << "\",\n";
-            state_ss << "    \"id\": \"" << match.person_id << "\",\n";
+            state_ss << "    \"name\": \"" << (match.matched ? match.name : "") << "\",\n";
+            state_ss << "    \"id\": \"" << (match.matched ? match.person_id : "") << "\",\n";
             state_ss << "    \"similarity\": " << match.similarity << ",\n";
             state_ss << "    \"bbox\": [" << face.bbox.x1 << "," << face.bbox.y1 << "," << face.bbox.x2 << "," << face.bbox.y2 << "]\n";
             state_ss << "  }\n";
@@ -1218,7 +1266,10 @@ int main(int argc, char* argv[]) {
     RK_CODEC_ID_E codec = RK_VIDEO_ID_AVC;
     std::string iq_dir = "/etc/iqfiles";
     std::string model_path = "/oem/usr/share/facial-recognition/model/yolov5n-face-rv1106.rknn";
-    std::string db_path = "/oem/usr/etc/facial-recognition/database.json";
+    std::string db_path = "/userdata/facial-recognition/database.json";
+    if (access("/userdata", W_OK) != 0 && access("/data", W_OK) != 0 && access("/oem/usr/etc/facial-recognition", W_OK) == 0) {
+        db_path = "/oem/usr/etc/facial-recognition/database.json";
+    }
 
     int opt;
     while ((opt = getopt(argc, argv, "w:h:b:e:a:m:d:R:T:N")) != -1) {

@@ -120,12 +120,12 @@ int B64(unsigned char c) {
 }
 
 std::string Base64Decode(const std::string& input) {
-    std::string out; int value = 0; int bits = -8;
+    std::string out; uint32_t value = 0; int bits = -8;
     for (unsigned char c : input) {
         if (c == '=') break;
         const int decoded = B64(c);
         if (decoded < 0) return {};
-        value = (value << 6) | decoded; bits += 6;
+        value = (value << 6) | static_cast<uint32_t>(decoded); bits += 6;
         if (bits >= 0) { out += static_cast<char>((value >> bits) & 0xff); bits -= 8; }
     }
     return out;
@@ -147,6 +147,11 @@ bool Authorized(const std::map<std::string, std::string>& headers) {
 }
 
 std::string GetDbPath() {
+    if (access("/userdata/facial-recognition/database.json", F_OK) == 0 ||
+        access("/userdata/facial-recognition", W_OK) == 0 ||
+        access("/userdata", W_OK) == 0) {
+        return "/userdata/facial-recognition/database.json";
+    }
     if (access(kDefaultDbPath, F_OK) == 0 || access("/oem/usr/etc/facial-recognition", W_OK) == 0) {
         return kDefaultDbPath;
     }
@@ -315,14 +320,14 @@ std::string AiEnroll(const std::string& name) {
         return "{\"success\":false,\"error\":{\"message\":\"Vui lòng nhập tên người cần đăng ký.\"}}";
     }
 
-    // Trigger enrollment request to fr-ai-service
+    // Trigger enrollment request to fr-media-service
     unlink(kEnrollResPath);
     std::ofstream req_file(kEnrollReqPath);
     req_file << "{\"name\":" << Json(name) << "}" << std::endl;
     req_file.close();
 
-    // Wait up to 2 seconds for fr-ai-service response
-    for (int i = 0; i < 20; ++i) {
+    // Wait up to 6 seconds for fr-media-service to capture real face embedding from camera
+    for (int i = 0; i < 60; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (access(kEnrollResPath, R_OK) == 0) {
             std::ifstream res_file(kEnrollResPath);
@@ -334,28 +339,8 @@ std::string AiEnroll(const std::string& name) {
         }
     }
 
-    // Direct fallback enrollment using FaceDatabase and synthetic vector if service didn't respond
-    fr::FaceDatabase db(GetDbPath());
-    fr::FaceFeature feat;
-    // Generate distinct signature based on name hash for demo/fallback verification
-    size_t seed = std::hash<std::string>{}(name);
-    for (size_t k = 0; k < fr::kFeatureDim; ++k) {
-        feat.data[k] = static_cast<float>((seed * (k + 17)) % 1000) / 1000.0f;
-    }
-    // L2-normalize
-    float sum_sq = 0.0f;
-    for (float v : feat.data) sum_sq += v * v;
-    float norm = std::sqrt(sum_sq);
-    if (norm > 0) {
-        for (float& v : feat.data) v /= norm;
-    }
-
-    std::string new_id;
-    if (db.AddPerson(name, {feat}, &new_id)) {
-        return Success("{\"id\":" + Json(new_id) + ",\"name\":" + Json(name) + ",\"note\":\"Đã lưu thành công vào cơ sở dữ liệu.\"}");
-    }
-
-    return "{\"success\":false,\"error\":{\"message\":\"Không thể lưu khuôn mặt vào cơ sở dữ liệu.\"}}";
+    unlink(kEnrollReqPath);
+    return "{\"success\":false,\"error\":{\"message\":\"Không phát hiện khuôn mặt đạt chuẩn trước camera trong 6 giây. Vui lòng đứng đối diện camera và thử lại!\"}}";
 }
 
 bool AiDeletePerson(const std::string& id) {
@@ -432,7 +417,7 @@ std::string RecordRoot() {
     return kRecordRoot;
 }
 
-// List .h264/.h265 segments directly in <root>/<date>/, skipping *.tmp.
+// List .h264/.h265 segments directly in <root>/<date>/, skipping *.tmp (Newest first).
 std::vector<RecFile> ListSegments(const std::string& date) {
     std::vector<RecFile> out;
     if (!SafeDate(date)) return out;
@@ -450,8 +435,9 @@ std::vector<RecFile> ListSegments(const std::string& date) {
         }
     }
     closedir(d);
+    // Sort descending by timestamp (newest segments first)
     std::sort(out.begin(), out.end(),
-              [](const RecFile& a, const RecFile& b) { return a.name < b.name; });
+              [](const RecFile& a, const RecFile& b) { return a.name > b.name; });
     return out;
 }
 
@@ -538,11 +524,14 @@ bool StreamFile(int client, const std::string& path, const std::string& filename
     if (fstat(input, &st) != 0 || !S_ISREG(st.st_mode)) { close(input); return false; }
     const long long size = static_cast<long long>(st.st_size);
 
+    const std::string content_type = filename.rfind(".h265") != std::string::npos ? "video/H265" : "video/H264";
+
     std::ostringstream head;
     head << "HTTP/1.1 200 OK\r\n"
-         << "Content-Type: video/H264\r\n"
+         << "Content-Type: " << content_type << "\r\n"
          << "Content-Length: " << size << "\r\n"
          << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n"
+         << "Accept-Ranges: bytes\r\n"
          << "Connection: close\r\nCache-Control: no-store\r\n\r\n";
     if (!SendAll(client, head.str())) { close(input); return false; }
 
