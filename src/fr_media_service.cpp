@@ -87,6 +87,8 @@ static const char* kDefaultRecordDir = "/mnt/sdcard/DCIM/ai";
 static volatile bool g_record_enabled = true;
 static bool g_record_force_dir = false;
 static int g_segment_seconds = 180;
+static int g_retention_days = 0;      // 0 = keep everything by age
+static uint64_t g_free_space_mb = 500; // free-space floor (MB); 0 = off
 static std::string g_record_dir = kDefaultRecordDir;
 static RK_CODEC_ID_E g_venc_codec = RK_VIDEO_ID_AVC;
 
@@ -124,6 +126,107 @@ static void RecoverPendingSegments(const std::string& root) {
         closedir(sub);
     }
     closedir(d);
+}
+
+
+// ---- SD retention -------------------------------------------------------
+
+bool SdFreeBytes(uint64_t* out) {
+    struct statvfs vfs;
+    std::string probe = g_record_dir;
+    for (int depth = 0; depth < 16; ++depth) {
+        if (statvfs(probe.c_str(), &vfs) == 0) {
+            *out = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+            return true;
+        }
+        const size_t slash = probe.find_last_of('/');
+        if (slash == std::string::npos || slash == 0) break;
+        probe = probe.substr(0, slash);
+    }
+    return false;
+}
+
+// "YYYYMMDD" string for the date `days` ago (0 = today, "" when days < 0).
+std::string DateCutoff(int days) {
+    if (days < 0) return {};
+    time_t now = time(nullptr);
+    time_t shifted = now - static_cast<time_t>(days) * 24 * 3600;
+    struct tm tmv {};
+    gmtime_r(&shifted, &tmv);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d", tmv.tm_year + 1900,
+             tmv.tm_mon + 1, tmv.tm_mday);
+    return buf;
+}
+
+// Remove every entry inside one date directory, then the directory itself.
+bool RemoveDateDir(const std::string& dir) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return false;
+    for (dirent* entry = nullptr; (entry = readdir(d)) != nullptr;) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        const std::string path = dir + "/" + name;
+        struct stat st {};
+        if (lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            RemoveDateDir(path);
+            rmdir(path.c_str());
+        } else {
+            unlink(path.c_str());
+        }
+    }
+    closedir(d);
+    return rmdir(dir.c_str()) == 0;
+}
+
+// Enforce retention: drop date directories older than the age limit and, when
+// free space falls below the floor, remove the oldest directories (never
+// today's active one) until the floor is met. Runs before each segment open.
+bool RunRetention() {
+    if (g_retention_days <= 0 && g_free_space_mb == 0) return true;
+
+    std::vector<std::string> days;
+    DIR* d = opendir(g_record_dir.c_str());
+    if (d) {
+        for (dirent* e = nullptr; (e = readdir(d)) != nullptr;) {
+            std::string name = e->d_name;
+            if (name.size() == 8) {
+                bool digit = true;
+                for (unsigned char c : name) {
+                    if (c < '0' || c > '9') { digit = false; break; }
+                }
+                if (digit) days.push_back(name);
+            }
+        }
+        closedir(d);
+    }
+    std::sort(days.begin(), days.end()); // oldest first ("YYYYMMDD" sortable)
+
+    const std::string cutoff = DateCutoff(g_retention_days);
+    for (const std::string& day : days) {
+        if (!cutoff.empty() && day < cutoff) {
+            RemoveDateDir(g_record_dir + "/" + day);
+            std::printf("[REC] retention: dropped old date dir %s (older than %d days)\n",
+                        day.c_str(), g_retention_days);
+        }
+    }
+
+    if (g_free_space_mb == 0) return true;
+    uint64_t free_bytes = 0;
+    if (!SdFreeBytes(&free_bytes)) return true;
+    const uint64_t floor = g_free_space_mb * 1024 * 1024;
+    const std::string today = DateCutoff(0);
+    size_t idx = 0;
+    while (free_bytes < floor && idx < days.size()) {
+        const std::string& day = days[idx];
+        if (!today.empty() && day == today) { ++idx; continue; }
+        RemoveDateDir(g_record_dir + "/" + day);
+        std::printf("[REC] retention: cleared date dir %s (free %llu MB)\n",
+                    day.c_str(), static_cast<unsigned long long>(free_bytes / (1024 * 1024)));
+        ++idx;
+        if (!SdFreeBytes(&free_bytes)) break;
+    }
+    return true;
 }
 
 void SigtermHandler(int sig) {
@@ -659,15 +762,19 @@ private:
         if (!ok) return false;
         const uint64_t free_bytes =
             static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
-        const uint64_t min_needed =
+        const uint64_t seg_needed =
             static_cast<uint64_t>(g_segment_seconds) * (g_u32Bitrate / 8) * 1024;
         const uint64_t min_needed_lo = 8 * 1024 * 1024;
-        if (free_bytes < std::max<uint64_t>(min_needed, min_needed_lo)) {
+        const uint64_t free_floor = g_free_space_mb > 0
+            ? g_free_space_mb * 1024 * 1024 : 0;
+        const uint64_t min_needed =
+            std::max<uint64_t>(std::max<uint64_t>(seg_needed, min_needed_lo), free_floor);
+        if (free_bytes < min_needed) {
             KeepaliveLog(("[REC] LOW_STORAGE free=" +
                           std::to_string(free_bytes / (1024 * 1024)) +
                           "MB need_min=" +
                           std::to_string(
-                              std::max<uint64_t>(min_needed, min_needed_lo) /
+                              min_needed /
                               (1024 * 1024)) + "MB").c_str());
             NotifyRecordState("LOW_STORAGE");
             return false;
@@ -717,6 +824,7 @@ private:
             std::printf("[REC] clock synced, resuming segments\n");
             clock_warned_ = false;
         }
+        RunRetention();
         if (!StorageOkToStart()) return false;
 
         RecoverPendingSegments(g_record_dir);
@@ -1272,7 +1380,7 @@ int main(int argc, char* argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "w:h:b:e:a:m:d:R:T:N")) != -1) {
+    while ((opt = getopt(argc, argv, "w:h:b:e:a:m:d:R:T:N:D:F:")) != -1) {
         switch (opt) {
             case 'w': width = std::atoi(optarg); break;
             case 'h': height = std::atoi(optarg); break;
@@ -1291,6 +1399,18 @@ int main(int argc, char* argv[]) {
             case 'T':
                 g_segment_seconds = std::max(10, std::atoi(optarg));
                 break;
+            case 'D': {
+                const char* p = optarg;
+                const long dv = p ? strtol(p, nullptr, 10) : 0;
+                g_retention_days = dv > 0 ? static_cast<int>(dv) : 0;
+                break;
+            }
+            case 'F': {
+                const char* p = optarg;
+                const long fv = p ? strtol(p, nullptr, 10) : 0;
+                g_free_space_mb = fv > 0 ? static_cast<uint64_t>(fv) : 0;
+                break;
+            }
             case 'N': g_record_enabled = false; break;
             default: break;
         }
@@ -1302,9 +1422,10 @@ int main(int argc, char* argv[]) {
         g_record_dir = env_dir;
         g_record_force_dir = true;
     }
-    std::printf("[REC] recording=%s dir=%s segment_seconds=%d codec=%s\n",
+    std::printf("[REC] recording=%s dir=%s segment_seconds=%d retention_days=%d free_floor=%lluMB codec=%s\n",
                 g_record_enabled ? "enabled" : "disabled", g_record_dir.c_str(),
-                g_segment_seconds,
+                g_segment_seconds, g_retention_days,
+                static_cast<unsigned long long>(g_free_space_mb),
                 codec == RK_VIDEO_ID_HEVC ? "H265" : "H264");
     NotifyRecordState(g_record_enabled ? "INITIALIZING" : "DISABLED");
 

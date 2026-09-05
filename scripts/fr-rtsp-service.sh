@@ -24,6 +24,8 @@ HEIGHT=1080
 BITRATE_KBPS=1024
 CODEC=h265
 SEGMENT_SECONDS=180
+RETENTION_DAYS=0
+FREE_SPACE_MB=500
 
 if [ -r "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
@@ -50,7 +52,7 @@ start() {
     [ -d "$IQ_DIR" ] || return 1
 
     export LD_LIBRARY_PATH=/oem/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-    "$MEDIA_BIN" -w "$WIDTH" -h "$HEIGHT" -a "$IQ_DIR" -e "$CODEC" -b "$BITRATE_KBPS" -T "$SEGMENT_SECONDS" -m "$MODEL_PATH" -d "$DB_PATH" >>"$LOG_FILE" 2>&1 &
+    "$MEDIA_BIN" -w "$WIDTH" -h "$HEIGHT" -a "$IQ_DIR" -e "$CODEC" -b "$BITRATE_KBPS" -T "$SEGMENT_SECONDS" -D "$RETENTION_DAYS" -F "$FREE_SPACE_MB" -m "$MODEL_PATH" -d "$DB_PATH" >>"$LOG_FILE" 2>&1 &
     echo $! >"$PID_FILE"
 }
 
