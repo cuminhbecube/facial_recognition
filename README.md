@@ -1,178 +1,175 @@
-# RV06 Dashcam SDK
+# Facial Recognition Firmware SDK (Rockchip RV1106 / Luckfox Pico Pro Max)
 
-Firmware/source tree for the LubanCat-RV06 (RV1106, SPI-NAND) dual-camera
-recorder. The production product is **BECAM-2 = RV1106 + PR2100K dual AHD +
-EC800M-CN with GNSS**. The project keeps the hardware camera pipeline, recorder,
-JT808/JT1078 media transport, cellular/GNSS management, RFID/GPLX reader, OSD and web
-configuration in one reproducible SDK build.
+Consolidated build tree for the **dedicated facial-recognition firmware** of a
+single-camera (SC3336 MIPI CSI-2) device based on Rockchip **RV1106** in the
+Luckfox Pico Pro Max layout (SPI-NAND, buildroot). It keeps the whole Rockchip
+`RV06_03` Linux SDK on top of which the Facial Recognition application is
+built: `sysdrv` (U-Boot / kernel / buildroot), `media` (RK ISP pipeline
+libraries) and the application itself, plus the prebuilt cross toolchain and
+`media_out` seed so a fresh clone can build without re-downloading the world.
+
+Current firmware version: **0.6.2** (see [`FIRMWARE_VERSION`](FIRMWARE_VERSION)).
 
 ## Hardware and runtime layout
 
-| Logical channel | AHD input | Decoder path | VI/pipe | Recording directory |
-|---|---|---|---|---|
-| CAM0 / CH1 | Front / VIN0 | PR2100K VC0 | 0/0 | `/mnt/sdcard/DCIM/front` |
-| CAM1 / CH2 | Rear / VIN1 | PR2100K VC1 | 1/1 | `/mnt/sdcard/DCIM/rear` |
+| Item | Value |
+|---|---|
+| SoC | Rockchip RV1106 (single-core ARM Cortex-A7, NPU 0.5 TOPs) |
+| Camera | 1x SC3336 MIPI CSI-2 (sensor IQ: `sc3336_CMK-OT2119-PC1_30IRC-F16.json`) |
+| Boot medium | SPI-NAND |
+| Rootfs | buildroot (`rv1106_lbc_defconfig`), UBIFS |
+| Network | wired Ethernet only — no Wi-Fi userspace or kernel modules |
+| Partition | `256K(env),256K@256K(idblock),512K(uboot),4M(boot),60M(oem),10M(userdata),180M(rootfs)` |
 
-PR2100K is controlled on I2C4 at `0x5f` and emits both channels as YUV422 over
-one two-lane MIPI CSI-2 link. Its reference crystal is 27 MHz. The direct
-OV8858/GC2053 topology is legacy.
-
-Recording uses hardware `VI -> VENC`; the H.265 files are written through a
-temporary file, flushed and atomically renamed only after a valid non-empty
-packet is received. The H.264 substreams are used for JT1078/CMSV6 live video
-and RTSP. The main H.265 recordings are used for local playback/search.
-
-The current firmware version is recorded in [`FIRMWARE_VERSION`](FIRMWARE_VERSION).
-Mutable settings are stored under `/run/rv06-config` on the dedicated `dashcfg`
-partition. They are deliberately not replaced by normal firmware/FOTA updates.
-
-## Services and protocols
-
-### JT808 / CMSV6
-
-The control connection authenticates to the configured CMS endpoint and keeps
-heartbeats/location reports active. Supported paths include device status,
-remote snapshot (`0x8801 -> 0x0805`), playback search (`0x9205 -> 0x1205`) and
-playback session setup (`0x9201`). Endpoint, channel, transport and stream
-parameters come from the CMS command; media endpoints are never hard-coded.
-
-### Four-VENC Architecture, JT1078 and RTSP
-
-All four hardware encoder channels run simultaneously on the RV1106 within the 64 MiB CMA budget:
-- **VENC0**: CAM0 Main (H.265, up to 1080p@20 / 720p@15) $\to$ SD Front Recording + RTSP CAM0 Main
-- **VENC1**: CAM1 Main (H.265, up to 1080p@20 / 720p@15) $\to$ SD Rear Recording + RTSP CAM1 Main
-- **VENC2**: CAM0 Sub (H.264, D1 / 360p / CIF, Bitrate 200–1000 Kbps) $\to$ JT1078 Ch1 + RTSP CAM0 Sub
-- **VENC3**: CAM1 Sub (H.264, D1 / 360p / CIF, Bitrate 200–1000 Kbps) $\to$ JT1078 Ch2 + RTSP CAM1 Sub
-
-Live video is sent to CMSV6 when requested with `0x9101` and stopped by `0x9102`.
-RTSP and JT1078 share VENC2/VENC3 fanout without allocating redundant encoders.
-All 4 RTSP endpoints support TCP interleaved streaming:
+The board profile is a symlinked-in project file:
 
 ```text
-rtsp://<device-ip>:554/live/cam0/main (H.265 Front Main)
-rtsp://<device-ip>:554/live/cam0/sub  (H.264 Front Sub)
-rtsp://<device-ip>:554/live/cam1/main (H.265 Rear Main)
-rtsp://<device-ip>:554/live/cam1/sub  (H.264 Rear Sub)
+.BoardConfig.mk -> project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-NONE-RV1106_Luckfox_Pico_Pro_Max-FACIAL_RECOGNITION.mk
 ```
 
-### EC800M-CN cellular and GNSS
+Set `RK_FACIAL_RECOGNITION_APP=y`; only `project/app/facial_recognition` is
+built and packaged to the `oem` partition.
 
-The production modem target is an EC800M-CN hardware variant with GNSS. The
-generic `CellularModemManager` and `GnssManager` discover the module, AT port,
-optional NMEA port and Linux data interface instead of relying on fixed
-`ttyUSB` numbers or `usb0`. The GNSS engine remains independent of OSD
-visibility; turning off GPS OSD does not stop JT808 positioning or the RFID GPS
-LED state.
+## Features
 
-EC800M-CN GNSS is optional by hardware variant. Exact SKU/revision, USB
-VID/PID, port layout and GNSS method are `CHUA XAC MINH` until `ATI`,
-`AT+CGMM`, `AT+CGMR` and GNSS capability probes pass on the physical module.
-EC25 remains a legacy compatibility profile; EG800AK is not a production
-target.
+- **AI face recognition**: YOLOv5n-Face NPU detection (640x640) with 5 facial
+  landmarks, face alignment and quality filtering, 128-D feature extraction,
+  and real-time Cosine Similarity matching against the enrolled person database.
+- **Enrollment**: add / view / delete persons interactively from the web UI
+  while standing in front of the camera.
+- **RTSP**: hardware VENC H.264/H.265 streaming on `rtsp://DEVICE_IP:554/live/0`.
+- **WebConfig & API**: HTTP server on port 80 with Basic Auth (`root`),
+  dashboard, stream config, AI management and storage retention.
+- **SD storage retention**: per-day segmented recordings with auto-cleanup
+  controlled by a *keep-last-N-days* limit plus a *free-space floor* (MiB),
+  configurable from the web UI and applied by the media service through
+  `-D <days>` / `-F <space_mb>`.
 
-The discovery, migration and validation contract is documented in
-[`project/app/dashcam/docs/CELLULAR_GNSS.md`](project/app/dashcam/docs/CELLULAR_GNSS.md).
+## Repository layout
 
-### RFID/GPLX reader
+| Path | Contents |
+|---|---|
+| `sysdrv/` | Rockchip U-Boot, kernel (incl. SC3336 driver + Pico Pro Max DTS) and buildroot sources with `dl/` cache |
+| `media/` | RK media libraries (ISP / IVA / rockit / rga / mpp ...) rebuilt when needed |
+| `output/out/media_out/` | Prebuilt media headers + libraries + IQ files the app links against (regenerated by `./build.sh media`) |
+| `tools/` | Linux packaging tools and the `arm-rockchip830-linux-uclibcgnueabihf` cross toolchain |
+| `project/app/facial_recognition/` | The Facial Recognition application (services, web UI, tests) |
+| `project/app/capture_ai/` | `3rdparty/rknpu2` + detection model (`yolov5n-face-rv1106.rknn`) used by the app |
+| `project/cfg/` | BoardConfig profiles, including the FACIAL_RECOGNITION one |
+| `docs/`, `config/`, `sdk-overlay/` | SDK-level documentation, configuration and startup overlay |
 
-The reader is `/dev/ttyS3`, `115200 8N1`. It is event-driven: the production
-manager does not poll `READ_CARD` every 250 ms. A persistent byte-stream parser
-accepts partial frames, multiple frames and unsolicited card events while the
-RX path remains active during ACC OFF. Duplicate cards are debounced for 500 ms.
-
-Card actions are:
-
-```text
-new card       -> LOGIN
-same active    -> LOGOUT
-different card -> SWITCH
-```
-
-The six physical indicators are POWER, NET, GPS, DRIVER, REC and BUZZER. The
-reader protocol value `0x13` is hardware FLASH; firmware does not implement a
-software blink loop. The 16-byte IO_CONTROL packet is:
-
-```text
-7E 03 00 0B [BUZZER] [POWER] [NET] [GPS] [DRIVER] [REC]
-   [0x00] [0x00] [0x00] [0x00] [0x00] [CHECKSUM]
-```
-
-The unused Alarm/CAM0..CAM3 fields are always zero. LED priority is:
-
-| LED | OFF | FLASH (`0x13`) | ON |
-|---|---|---|---|
-| POWER | ACC/system stopped | ACC startup or shutdown transition | ACC on and initialized |
-| NET | unavailable/no IP | connecting or reconnecting | CMS/JT808 authenticated |
-| GPS | GNSS unavailable | engine alive, searching/stale fix | current valid fix |
-| DRIVER | no driver | short invalid/rejected-card indication | driver logged in |
-| REC | recorder stopped | startup, flush, degraded/error/storage fault | healthy recording |
-| BUZZER | normal | not used | 100–150 ms pulse for accepted card/event |
-
-LED state is sent only when the complete desired packet changes. A state
-transition never flushes the RFID RX buffer, so push card frames are not lost.
-Detailed UART and DRV1 notes are in
-[`project/app/dashcam/docs/DRIVER_UART.md`](project/app/dashcam/docs/DRIVER_UART.md)
-and [`project/app/dashcam/docs/rfid_protocol.md`](project/app/dashcam/docs/rfid_protocol.md).
-
-### OSD and Web Config
-
-OSD is rendered into the existing hardware VENC regions. It can show time,
-GPS, speed, vehicle plate and driver identity independently. CAM0 uses `CH1`
-and CAM1 uses `CH2`; driver updates refresh existing regions without restarting
-the recorder. Web Config serves port 80 on LAN/Wi-Fi AP and stores validated
-configuration atomically.
+Build products (`output/out/*`, `Upgrade/*.img`, `sysdrv` build trees,
+`media/*/out`, per-app staged `out/`) are git-ignored and regenerated by the
+build. Only source, prebuilt seeds required for building, and documentation
+are tracked.
 
 ## Build
 
-Install the SDK dependencies (Ubuntu/Debian), source the Rockchip toolchain,
-then build from the SDK root:
+Recommended host: Ubuntu 20.04 / 22.04 / Debian 11 / 12.
 
 ```sh
-source tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/env_install_toolchain.sh
-./build.sh lunch BoardConfig-SPI_NAND-NONE-RV1106_LubanCat-RV06.mk
-make -C project/app/dashcam clean all
-./build.sh app
+sudo apt-get install -y git ssh make gcc gcc-multilib g++-multilib module-assistant g++ gawk texinfo libssl-dev bison flex fakeroot cmake unzip gperf autoconf device-tree-compiler libncurses5-dev pkg-config bc python-is-python3 passwd openssl vim file cpio rsync
+```
+
+The board profile is already active via `.BoardConfig.mk`; print it and build:
+
+```sh
+./build.sh info
 ./build.sh firmware
 ```
 
-The application binary is `project/app/dashcam/rv06_dashcam`. The complete
-Rockchip package is `output/image/update.img`; the versioned copy is
-`Upgrade/upgrade-<version>.img`. Verify a package before flashing:
+One-click build from clean state (equivalent):
 
 ```sh
-sha256sum output/image/update.img Upgrade/upgrade-*.img
-tools/linux/Linux_Pack_Firmware/mk-update_unpack.sh \
-  -i output/image/update.img -o /tmp/rv06-update-check
+source tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/env_install_toolchain.sh
+./build.sh lunch
+./build.sh
+./build.sh firmware
 ```
 
-Do not flash a package that has not passed this unpack and checksum check.
+Useful partial builds:
 
-## Target validation
+| Command | Builds |
+|---|---|
+| `./build.sh uboot` | U-Boot → `output/image/MiniLoaderAll.bin`, `output/image/uboot.img` |
+| `./build.sh kernel` | Kernel → `output/image/boot.img` |
+| `./build.sh rootfs` | Buildroot rootfs |
+| `./build.sh media` | RK media libraries → `output/out/media_out` |
+| `./build.sh app` | Application → `output/out/app_out` and `output/out/oem` |
+| `./build.sh firmware` | Package everything → `output/image` + `Upgrade/upgrade-0.6.2.img` |
 
-Runtime claims require target evidence, not only a host build. Check:
+The versioned update image (`Upgrade/upgrade-<version>.img`) is git-ignored
+and regenerated per release. Verify before flashing:
 
 ```sh
-grep -E '\[DASHCAM|\[ISP|\[PIPE|\[VENC|\[REC' /tmp/dashcam/recorder.log
-grep -E 'RFID_LED|RFID_RX|RFID_CARD|RFID_DUP|RFID_STAT' /tmp/dashcam/recorder.log
-mount | grep /mnt/sdcard
-df -h /mnt/sdcard
-ls -lht /mnt/sdcard/DCIM/front /mnt/sdcard/DCIM/rear
+sha256sum Upgrade/upgrade-0.6.2.img
+tools/linux/Linux_Pack_Firmware/mk-update_unpack.sh -i output/image/update.img -o /tmp/update-check
 ```
 
-Confirm JT808 `state=ONLINE`, growing front/rear recordings, and independent
-CAM0/CAM1 frame counters. Flashing requires Rockchip Loader/Maskrom mode:
+Flash with the Rockchip upgrade tool in Loader/Maskrom mode:
 
 ```sh
 tools/linux/Linux_Upgrade_Tool/rkdownload.sh -d output/image
 ```
 
-The project does not include device credentials. Use the approved deployment
-procedure for the target and never commit passwords, tokens or private keys.
+## Target run-time
+
+Services and logs on `/oem` (read-only partition):
+
+| Service | Binary | Log |
+|---|---|---|
+| AI (detection / recognition / enrollment) | `/oem/usr/bin/fr-ai-service` | `/var/log/fr-ai.log` |
+| Media / RTSP | `/oem/usr/bin/fr-media-service` + `fr-rtsp-service` | `/var/log/fr-rtsp.log` |
+| WebConfig | `/oem/usr/bin/fr-webconfig` | `/var/log/fr-web.log` |
+
+Configuration: `/oem/usr/etc/facial-recognition/rtsp.conf` (codec, bitrate,
+`RETENTION_DAYS`, `FREE_SPACE_MB`). Manage services:
+
+```sh
+/oem/usr/bin/fr-rtsp-service status|restart
+tail -f /var/log/fr-rtsp.log /var/log/fr-ai.log
+```
+
+Web UI: `http://DEVICE_IP/` (login `root`).
+
+### API summary
+
+| Endpoint | Description |
+|---|---|
+| `GET  /api/v1/status` | Overall device status |
+| `GET  /api/v1/stream/status` | Camera / stream status |
+| `GET  /api/v1/stream/config`, `PUT /api/v1/stream/config` | Stream config get / set |
+| `PUT  /api/v1/rtsp` | RTSP + storage retention (`retention_days`, `free_space_mb`), restarts media service |
+| `GET  /api/v1/ai/status` | AI service status |
+| `GET  /api/v1/ai/persons` | Enrolled persons |
+| `POST /api/v1/ai/enroll` | Enroll the person in front of the camera |
+| `DELETE /api/v1/ai/persons` | Delete an enrolled person |
+
+## Target validation
+
+Runtime claims require target evidence. After flashing:
+
+```sh
+ps | grep fr-
+tail -f /var/log/fr-rtsp.log /var/log/fr-ai.log
+mount | grep /oem
+df -h /oem /mnt/sdcard
+ls -lht /mnt/sdcard/DCIM/
+curl -u root:<password> http://DEVICE_IP/api/v1/stream/config
+```
 
 ## Repository hygiene
 
-Tracked source, documentation, scripts and configuration are the project of
-record. Build output, SDK media build directories, generated images, temporary
-logs, editor swap files and local deployment helpers are ignored or kept out of
-commits. Do not delete `dashcfg` data, target backups or firmware images that
-are needed for rollback without an explicit release/retention decision.
+- Tracked source, docs, scripts and configuration are the project of record.
+- Build output, generated SPDX/FOTA images, local deployment helpers and logs
+  are ignored — never commit them.
+- No device credentials, passwords, tokens or private keys are stored in this
+  repository.
+- Do not copy the SDK tree under Windows before building: executable
+  permissions and symlinks (e.g. `.BoardConfig.mk`) are lost.
+
+## See also
+
+- Component documentation: `project/app/facial_recognition/docs/`
+- Implementation plan / status: `project/app/facial_recognition/docs/implementation-plan.md`
+- Firmware status: [`CURRENT_STATUS.md`](CURRENT_STATUS.md), [`PROJECT_STATUS.md`](PROJECT_STATUS.md)
