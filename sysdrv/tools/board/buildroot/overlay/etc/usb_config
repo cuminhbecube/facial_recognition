@@ -1,0 +1,8 @@
+# OTG_MODE:host or peripheral
+# OTG_MODE=peripheral
+OTG_MODE=host
+
+# GADGET_CONFIG:usb_mtp_en usb_adb_en usb_ums_en usb_ntb_en
+# usb_acm_en usb_uac1_en usb_uac2_en usb_uvc_en usb_rndis_en usb_hid_en
+GADGET_CONFIG="usb_rndis_en"
+

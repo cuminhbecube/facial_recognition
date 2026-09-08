@@ -1,0 +1,49 @@
+#!/bin/sh
+
+# set -x
+
+init_start()
+{
+    echo "runing net4g init"
+
+    [ ! -e /dev/ttyUSB2 ] && exit
+
+    cat /dev/ttyUSB2 1>/tmp/4G.log &
+    PID=$!
+
+    sleep 0.2
+    echo -e 'AT+MDIALUPCFG="auto"\r\n' > /dev/ttyUSB2
+
+    sleep 0.2
+    MDIALUPCFG=$(grep MDIALUPCFG  /tmp/4G.log | grep \"auto\",0 | tr -d ' ')
+
+    # 判读当前是否为自动拨号模式
+    if [ ${MDIALUPCFG} ]; then
+        echo "net4g init: set MDIALUPCFG auto:1"
+        # 配置为自动拨号模式
+        sleep 0.2
+        echo -e 'AT+MDIALUPCFG="auto",1\r\n' > /dev/ttyUSB2
+
+        # 进行拨号
+        sleep 0.2
+        echo -e 'AT+MDIALUP=1,1\r\n' > /dev/ttyUSB2
+    fi
+
+    sleep 0.2
+    kill $PID
+
+    ifconfig eth1 up
+    udhcpc -i eth1
+    echo "net4g init successful"
+}
+
+echo "net4g init scripts"
+
+case $1 in
+	start)
+		init_start
+		;;
+	*)
+		exit 1
+		;;
+esac

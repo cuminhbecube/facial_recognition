@@ -1,0 +1,1 @@
+/home/vunl/RV06_03_Linux_SDK/project/cfg/BoardConfig_IPC/RK-RELEASE-NOTES-IPC.txt

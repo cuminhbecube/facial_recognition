@@ -1,0 +1,55 @@
+#!/bin/sh
+[ -f /etc/profile.d/RkEnv.sh ] && source /etc/profile.d/RkEnv.sh
+case $1 in
+	start)
+		if [ -r /var/run/rv06-dashcam-launcher.pid ]; then
+			launcher_pid=$(cat /var/run/rv06-dashcam-launcher.pid 2>/dev/null)
+			case $launcher_pid in
+				''|*[!0-9]*) launcher_pid= ;;
+			esac
+			if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" 2>/dev/null; then
+				echo "[S21APPINIT] state=ALREADY_RUNNING launcher_pid=$launcher_pid"
+				exit 0
+			fi
+			rm -f /var/run/rv06-dashcam-launcher.pid
+		fi
+		sh /oem/usr/bin/RkLunch.sh
+		if [ -f /oem/usr/bin/dashcam.sh ]; then
+			mkdir -p /tmp/dashcam
+			sh /oem/usr/bin/dashcam.sh >>/tmp/dashcam/launcher.log 2>&1 &
+			echo $! >/var/run/rv06-dashcam-launcher.pid
+		fi
+		;;
+	stop)
+		launcher_pid=
+		if [ -r /var/run/rv06-dashcam-launcher.pid ]; then
+			launcher_pid=$(cat /var/run/rv06-dashcam-launcher.pid 2>/dev/null)
+			case $launcher_pid in ''|*[!0-9]*) launcher_pid= ;; esac
+		fi
+		if [ -n "$launcher_pid" ]; then
+			kill "$launcher_pid" 2>/dev/null || true
+		fi
+		killall rv06_dashcam rv06_webconfig dashcam_main tee 2>/dev/null || true
+		logmon_pid=
+		if [ -r /var/run/rv06-logmon.pid ]; then
+			logmon_pid=$(cat /var/run/rv06-logmon.pid 2>/dev/null)
+			case $logmon_pid in ''|*[!0-9]*) logmon_pid= ;; esac
+		fi
+		[ -n "$logmon_pid" ] && kill "$logmon_pid" 2>/dev/null || true
+		waited=0
+		while [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" 2>/dev/null && [ "$waited" -lt 5 ]; do
+			sleep 1
+			waited=$((waited + 1))
+		done
+		if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" 2>/dev/null; then
+			kill -KILL "$launcher_pid" 2>/dev/null || true
+		fi
+		rm -f /var/run/rv06-dashcam-launcher.pid
+		rm -f /var/run/rv06-webconfig.pid
+		rm -f /var/run/rv06-logmon.pid
+		sh /oem/usr/bin/RkLunch-stop.sh
+		;;
+	*)
+		exit 1
+		;;
+esac

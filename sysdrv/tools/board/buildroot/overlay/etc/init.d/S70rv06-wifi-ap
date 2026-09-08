@@ -1,0 +1,474 @@
+#!/bin/sh
+
+IFACE="wlan0"
+AP_IP="192.168.50.1"
+PSK_FILE="/run/rv06-config/wifi-ap.psk"
+CONFIG_FILE="/run/rv06-config/wifi-ap.conf"
+RUN_DIR="/run/rv06-wifi-ap"
+LOCK_DIR="/run/rv06-wifi-ap.lock"
+HOSTAPD_CONF="$RUN_DIR/hostapd.conf"
+DNSMASQ_CONF="$RUN_DIR/dnsmasq.conf"
+MONITOR_PID="$RUN_DIR/monitor.pid"
+STATE_FILE="$RUN_DIR/state"
+DESIRED_SSID_FILE="$RUN_DIR/desired_ssid"
+ACTIVE_SSID_FILE="$RUN_DIR/active_ssid"
+PENDING_FILE="$RUN_DIR/reconfigure_pending"
+DRIVER_WAIT_SECONDS=30
+AP_READY_WAIT_SECONDS=15
+MONITOR_INTERVAL_SECONDS=5
+RECOVERY_BACKOFF_SECONDS=15
+MAX_RECOVERY_ATTEMPTS=3
+RECOVERY_RESET_SECONDS=120
+DEFAULT_WIFI_PASSWORD=88888888
+
+log() { echo "[WIFI_AP] $*"; }
+
+set_state() {
+    mkdir -p "$RUN_DIR"
+    printf '%s\n' "$1" > "$STATE_FILE"
+}
+
+get_state() {
+    cat "$STATE_FILE" 2>/dev/null || printf '%s' STOPPED
+}
+
+read_desired_ssid() {
+    sed -n 's/^ssid=//p' "$CONFIG_FILE" 2>/dev/null | head -n 1
+}
+
+mark_reconfigure_pending() {
+    mkdir -p "$RUN_DIR"
+    : > "$PENDING_FILE"
+}
+
+lock_acquire() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+    owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    case "$owner" in
+        ''|*[!0-9]*) rm -rf "$LOCK_DIR" 2>/dev/null || true ;;
+        *) kill -0 "$owner" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null || true ;;
+    esac
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+    return 1
+}
+
+lock_release() {
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+default_suffix() {
+    imei=$(sed -n 's/^imei=//p' /run/rv06-config/device-identity.conf 2>/dev/null | \
+        head -n 1 | tr -cd '0-9')
+    [ "${#imei}" -eq 15 ] || return 1
+    printf '%s' "$imei" | tail -c 6
+}
+
+write_default_wifi_config() {
+    suffix=$(default_suffix || true)
+    if [ -z "$suffix" ]; then
+        # Never leave a factory-fresh device inaccessible merely because EC25
+        # has not completed its first IMEI query yet.  This fixed provisioning
+        # AP is neither a MAC-derived nor random identity; EC25 replaces it
+        # with DASHCAM-<last6 IMEI> as soon as the real identity is available.
+        suffix=000000
+        log "state=PROVISIONING_WAITING_FOR_IMEI ssid=DASHCAM-$suffix"
+    fi
+    mkdir -p /run/rv06-config
+    umask 077
+    config_tmp=$CONFIG_FILE.default-new
+    psk_tmp=$PSK_FILE.default-new
+    {
+        printf 'ssid=DASHCAM-%s\n' "$suffix"
+        printf 'channel=6\n'
+    } > "$config_tmp" || return 1
+    printf '%s\n' "$DEFAULT_WIFI_PASSWORD" > "$psk_tmp" || return 1
+    chmod 0600 "$config_tmp" "$psk_tmp" || return 1
+    mv "$config_tmp" "$CONFIG_FILE" || return 1
+    mv "$psk_tmp" "$PSK_FILE" || return 1
+    sync
+    log "state=DEFAULTS_REGENERATED ssid=DASHCAM-$suffix"
+}
+
+wifi_config_valid() {
+    [ -r "$PSK_FILE" ] && [ -r "$CONFIG_FILE" ] || return 1
+
+    configured_ssid=$(sed -n 's/^ssid=//p' "$CONFIG_FILE" | head -n 1)
+    configured_channel=$(sed -n 's/^channel=//p' "$CONFIG_FILE" | head -n 1)
+    case "$configured_ssid" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#configured_ssid}" -le 32 ] || return 1
+    case "$configured_channel" in 1|6|11) ;; *) return 1 ;; esac
+
+    configured_psk=$(cat "$PSK_FILE" 2>/dev/null) || return 1
+    case "$configured_psk" in '') return 1 ;; esac
+    case "${#configured_psk}" in
+        64)
+            case "$configured_psk" in *[!0-9A-Fa-f]*) return 1 ;; esac
+            ;;
+        8|9|[1-5][0-9]|6[0-3]) ;;
+        *) return 1 ;;
+    esac
+}
+
+pid_alive() {
+    [ -r "$1" ] || return 1
+    pid=$(cat "$1" 2>/dev/null) || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/stat" ] || return 1
+    case "$(cat "/proc/$pid/stat" 2>/dev/null)" in *') Z '*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null
+}
+
+ap_healthy() {
+    ip link show "$IFACE" >/dev/null 2>&1 || return 1
+    iw dev "$IFACE" info 2>/dev/null | grep -q 'type AP' || return 1
+    ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet $AP_IP/24" || return 1
+    pid_alive "$RUN_DIR/hostapd.pid" || return 1
+    pid_alive "$RUN_DIR/dnsmasq.pid" || return 1
+}
+
+owned_process_pid() {
+    expected=$1
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        cmd=$(tr '\000' ' ' < "$proc/cmdline" 2>/dev/null) || continue
+        case "$cmd" in *"$expected"*) printf '%s\n' "${proc##*/}"; return 0 ;; esac
+    done
+    return 1
+}
+
+stop_pid_file() {
+    pid_file=$1
+    if pid_alive "$pid_file"; then
+        kill "$(cat "$pid_file")" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+stop_owned_process() {
+    pid_file=$1
+    expected=$2
+    pid=''
+    if pid_alive "$pid_file"; then
+        pid=$(cat "$pid_file" 2>/dev/null)
+    else
+        pid=$(owned_process_pid "$expected" 2>/dev/null || true)
+    fi
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        wait_seconds=0
+        while kill -0 "$pid" 2>/dev/null && [ "$wait_seconds" -lt 3 ]; do
+            sleep 1
+            wait_seconds=$((wait_seconds + 1))
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+stop_ap_processes() {
+    stop_owned_process "$RUN_DIR/dnsmasq.pid" "--conf-file=$DNSMASQ_CONF"
+    stop_owned_process "$RUN_DIR/hostapd.pid" "$HOSTAPD_CONF"
+    ip addr del "$AP_IP/24" dev "$IFACE" 2>/dev/null || true
+}
+
+monitor_ap() {
+    failures=0
+    recovery_attempts=0
+    healthy_seconds=0
+    while :; do
+        sleep "$MONITOR_INTERVAL_SECONDS"
+        if ap_healthy; then
+            failures=0
+            healthy_seconds=$((healthy_seconds + MONITOR_INTERVAL_SECONDS))
+            if [ "$healthy_seconds" -ge "$RECOVERY_RESET_SECONDS" ]; then
+                recovery_attempts=0
+                healthy_seconds=0
+            fi
+            continue
+        fi
+        healthy_seconds=0
+        failures=$((failures + 1))
+        [ "$failures" -lt 2 ] && continue
+        if [ "$recovery_attempts" -ge "$MAX_RECOVERY_ATTEMPTS" ]; then
+            log "state=DEGRADED reason=RECOVERY_LIMIT_REACHED attempts=$recovery_attempts recorder_affected=0"
+            rm -f "$MONITOR_PID"
+            return 0
+        fi
+        recovery_attempts=$((recovery_attempts + 1))
+        log "state=RECOVERING reason=AP_HEALTH_CHECK_FAILED iface=$IFACE recorder_affected=0"
+        if ! lock_acquire; then
+            log "action=RECOVER state=BUSY detail=LOCK_CONTENDED"
+            sleep "$RECOVERY_BACKOFF_SECONDS"
+            continue
+        fi
+        restart_ap no-monitor
+        lock_release
+        if ap_healthy; then
+            log "state=RECOVERED iface=$IFACE ip=$AP_IP recorder_affected=0"
+            failures=0
+        else
+            log "state=RECOVERY_FAILED iface=$IFACE retry_seconds=$RECOVERY_BACKOFF_SECONDS recorder_affected=0"
+        fi
+        sleep "$RECOVERY_BACKOFF_SECONDS"
+    done
+}
+
+start_monitor() {
+    pid_alive "$MONITOR_PID" && return 0
+    monitor_ap >>/tmp/rv06-wifi-ap.log 2>&1 &
+    echo $! > "$MONITOR_PID"
+    log "state=MONITOR_STARTED pid=$! interval_seconds=$MONITOR_INTERVAL_SECONDS"
+}
+
+ap_supported() {
+    command -v iw >/dev/null 2>&1 || return 1
+    ip link show "$IFACE" >/dev/null 2>&1 || return 1
+    iw list 2>/dev/null | awk '
+        /Supported interface modes:/ { modes=1; next }
+        modes && /^Band / { exit found ? 0 : 1 }
+        modes && /\* AP$/ { found=1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+start_ap() {
+    set_state STARTING
+    log "action=START state=STARTING iface=$IFACE"
+    wait_seconds=0
+    while ! ap_supported; do
+        if [ "$wait_seconds" -ge "$DRIVER_WAIT_SECONDS" ]; then
+            log "state=NOT_SUPPORTED iface=$IFACE wait_seconds=$wait_seconds recorder_affected=0"
+            return 1
+        fi
+        if [ $((wait_seconds % 5)) -eq 0 ]; then
+            log "state=WAIT_DRIVER iface=$IFACE elapsed_seconds=$wait_seconds"
+        fi
+        sleep 1
+        wait_seconds=$((wait_seconds + 1))
+    done
+    log "state=DRIVER_READY iface=$IFACE wait_seconds=$wait_seconds"
+    if ! iw dev "$IFACE" set power_save off 2>/dev/null; then
+        log "state=WARNING stage=POWER_SAVE detail=NOT_SUPPORTED"
+    fi
+    if ! ip link show "$IFACE" >/dev/null 2>&1; then
+        log "state=ERROR stage=INTERFACE_DISAPPEARED recorder_affected=0"
+        return 1
+    fi
+    if ! wifi_config_valid; then
+        log "state=DEFAULTS_REQUIRED reason=WIFI_CONFIG_INVALID_OR_MISSING"
+        if ! write_default_wifi_config; then
+            log "state=DISABLED reason=DEFAULT_WIFI_WRITE_FAILED recorder_affected=0"
+            return 1
+        fi
+    fi
+    psk=$(cat "$PSK_FILE")
+    case "$psk" in
+        ''|*[!0-9A-Fa-f]*)
+            # Factory provisioning uses the explicitly specified WPA2
+            # passphrase.  Existing Web-configured entries remain PBKDF2 PSKs.
+            if [ "${#psk}" -lt 8 ] || [ "${#psk}" -gt 63 ]; then
+                log "state=DISABLED reason=INVALID_PSK_FORMAT"
+                return 1
+            fi
+            wifi_secret="wpa_passphrase=$psk"
+            ;;
+        *)
+            if [ "${#psk}" -eq 64 ]; then
+                wifi_secret="wpa_psk=$psk"
+            elif [ "${#psk}" -ge 8 ] && [ "${#psk}" -le 63 ]; then
+                wifi_secret="wpa_passphrase=$psk"
+            else
+                log "state=DISABLED reason=INVALID_PSK_LENGTH"
+                return 1
+            fi
+            ;;
+    esac
+    ssid="DASHCAM-UNREADY"
+    channel=6
+    if [ -r "$CONFIG_FILE" ]; then
+        configured_ssid=$(sed -n 's/^ssid=//p' "$CONFIG_FILE" | head -n 1)
+        configured_channel=$(sed -n 's/^channel=//p' "$CONFIG_FILE" | head -n 1)
+        case "$configured_ssid" in
+            ''|*[!A-Za-z0-9._-]*) ;;
+            *) [ "${#configured_ssid}" -le 32 ] && ssid=$configured_ssid ;;
+        esac
+        case "$configured_channel" in 1|6|11) channel=$configured_channel ;; esac
+    fi
+    printf '%s\n' "$ssid" > "$DESIRED_SSID_FILE"
+    mkdir -p "$RUN_DIR"
+    chmod 0700 "$RUN_DIR"
+    umask 077
+    cat >"$HOSTAPD_CONF" <<EOF
+interface=$IFACE
+driver=nl80211
+ssid=$ssid
+hw_mode=g
+channel=$channel
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+$wifi_secret
+ap_isolate=1
+max_num_sta=4
+EOF
+    cat >"$DNSMASQ_CONF" <<EOF
+interface=$IFACE
+bind-interfaces
+except-interface=lo
+dhcp-range=192.168.50.10,192.168.50.100,255.255.255.0,12h
+dhcp-option=3,$AP_IP
+dhcp-option=6,$AP_IP
+address=/#/$AP_IP
+no-resolv
+domain-needed
+bogus-priv
+pid-file=$RUN_DIR/dnsmasq.pid
+leasefile-ro
+EOF
+    unset psk
+    killall wpa_supplicant 2>/dev/null || true
+    stop_ap_processes
+    ip link set "$IFACE" down
+    ip addr flush dev "$IFACE"
+    ip link set "$IFACE" up
+    if ! hostapd -B -P "$RUN_DIR/hostapd.pid" "$HOSTAPD_CONF" >/tmp/rv06-hostapd.log 2>&1; then
+        log "state=ERROR stage=HOSTAPD recorder_affected=0"
+        sed 's/^/[WIFI_AP][HOSTAPD] /' /tmp/rv06-hostapd.log
+        return 1
+    fi
+
+    # AIC8800 returns from hostapd before its asynchronous AP transition is
+    # complete. Assigning IPv4 earlier is lost when the driver resets wlan0.
+    ready_seconds=0
+    while [ "$(cat /sys/class/net/$IFACE/operstate 2>/dev/null)" != "up" ]; do
+        if [ "$ready_seconds" -ge "$AP_READY_WAIT_SECONDS" ]; then
+            log "state=ERROR stage=AP_READY_TIMEOUT wait_seconds=$ready_seconds recorder_affected=0"
+            sed 's/^/[WIFI_AP][HOSTAPD] /' /tmp/rv06-hostapd.log
+            stop_pid_file "$RUN_DIR/hostapd.pid"
+            return 1
+        fi
+        sleep 1
+        ready_seconds=$((ready_seconds + 1))
+    done
+    log "state=AP_READY iface=$IFACE wait_seconds=$ready_seconds"
+
+    ip addr add "$AP_IP/24" dev "$IFACE"
+    sleep 1
+    if ! ip -4 addr show dev "$IFACE" | grep -q "inet $AP_IP/24"; then
+        log "state=ERROR stage=IP_ASSIGN address=$AP_IP recorder_affected=0"
+        stop_pid_file "$RUN_DIR/hostapd.pid"
+        return 1
+    fi
+    if ! dnsmasq --conf-file="$DNSMASQ_CONF" >/tmp/rv06-dnsmasq.log 2>&1; then
+        stop_pid_file "$RUN_DIR/hostapd.pid"
+        log "state=ERROR stage=DHCP recorder_affected=0"
+        sed 's/^/[WIFI_AP][DNSMASQ] /' /tmp/rv06-dnsmasq.log
+        return 1
+    fi
+    printf '%s\n' "$ssid" > "$ACTIVE_SSID_FILE"
+    set_state READY
+    log "state=READY active_ssid=$ssid ip=$AP_IP hostapd=1 dnsmasq=1 clients=0 internet_sharing=0"
+    if [ -f "$PENDING_FILE" ]; then
+        rm -f "$PENDING_FILE"
+        desired_ssid=$(read_desired_ssid)
+        if [ -n "$desired_ssid" ] && [ "$desired_ssid" != "$ssid" ]; then
+            log "pending_reconfigure=1 action=SERIALIZED_RESTART active_ssid=$ssid desired_ssid=$desired_ssid"
+            restart_ap no-monitor
+            return $?
+        fi
+    fi
+    [ "${1:-}" = "no-monitor" ] || start_monitor
+}
+
+stop_ap() {
+    if [ "${1:-}" != "no-monitor" ] && pid_alive "$MONITOR_PID"; then
+        kill "$(cat "$MONITOR_PID")" 2>/dev/null || true
+    fi
+    stop_ap_processes
+    rm -f "$RUN_DIR/hostapd.pid" "$RUN_DIR/dnsmasq.pid" "$HOSTAPD_CONF" "$DNSMASQ_CONF" "$ACTIVE_SSID_FILE"
+    set_state STOPPED
+    log "state=STOPPED"
+}
+
+restart_ap() {
+    mode=${1:-}
+    set_state RESTARTING
+    log "action=RESTART state=RESTARTING"
+    stop_ap "$mode"
+    start_ap "$mode"
+}
+
+start_locked() {
+    desired_ssid=$(read_desired_ssid)
+    active_ssid=$(cat "$ACTIVE_SSID_FILE" 2>/dev/null || true)
+    if ap_healthy && [ -n "$desired_ssid" ] && [ "$active_ssid" = "$desired_ssid" ]; then
+        set_state READY
+        log "action=START state=READY detail=ALREADY_READY active_ssid=$active_ssid"
+        return 0
+    fi
+    if ap_healthy; then
+        restart_ap
+    else
+        start_ap
+    fi
+}
+
+reconfigure_locked() {
+    desired_ssid=$(read_desired_ssid)
+    active_ssid=$(cat "$ACTIVE_SSID_FILE" 2>/dev/null || true)
+    if [ -n "$desired_ssid" ] && ap_healthy && [ "$active_ssid" = "$desired_ssid" ]; then
+        rm -f "$PENDING_FILE"
+        set_state READY
+        log "identity_update=1 desired_ssid=$desired_ssid state=READY action=NO_CHANGE"
+        return 0
+    fi
+    rm -f "$PENDING_FILE"
+    log "identity_update=1 desired_ssid=${desired_ssid:-UNKNOWN} action=SERIALIZED_RESTART"
+    restart_ap
+}
+
+case "$1" in
+    reconfigure)
+        if ! lock_acquire; then
+            mark_reconfigure_pending
+            log "identity_update=1 desired_ssid=$(read_desired_ssid) state=$(get_state) action=DEFER_RECONFIGURE"
+            exit 0
+        fi
+        trap 'lock_release; exit 1' HUP INT TERM
+        reconfigure_locked
+        result=$?
+        lock_release
+        trap - HUP INT TERM
+        exit "$result"
+        ;;
+    start|restart|stop)
+        if ! lock_acquire; then
+            [ "$1" = "stop" ] || mark_reconfigure_pending
+            log "action=$1 state=BUSY detail=LOCK_CONTENDED"
+            exit 0
+        fi
+        trap 'lock_release; exit 1' HUP INT TERM
+        case "$1" in
+            start) start_locked ;;
+            restart) restart_ap ;;
+            stop) stop_ap ;;
+        esac
+        result=$?
+        lock_release
+        trap - HUP INT TERM
+        exit "$result"
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|reconfigure}"; exit 1 ;;
+esac

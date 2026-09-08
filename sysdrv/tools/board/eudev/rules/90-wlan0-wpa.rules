@@ -1,0 +1,2 @@
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/sbin/wpa_supplicant -Dnl80211 -iwlan0 -c/etc/wpa_supplicant.conf -B"
+ACTION=="remove", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/bin/pkill -f '/usr/sbin/wpa_supplicant -Dnl80211 -iwlan0'"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# RV06 AP lifecycle is owned by S70rv06-wifi-ap.
+exit 0

@@ -1,0 +1,55 @@
+#!/bin/sh
+
+CONFIG=/etc/device-mac.conf
+
+set_mac() {
+	iface="$1"
+	mac="$2"
+
+	[ -d "/sys/class/net/$iface" ] || {
+		echo "[StableMAC] $iface not present; skipping"
+		return 0
+	}
+
+	echo "$mac" | grep -Eq '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' || {
+		echo "[StableMAC] invalid MAC for $iface: $mac"
+		return 1
+	}
+
+	current=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
+	if [ "$current" = "$mac" ]; then
+		echo "[StableMAC] $iface already uses $mac"
+		return 0
+	fi
+
+	ifconfig "$iface" down 2>/dev/null || true
+	if ifconfig "$iface" hw ether "$mac"; then
+		echo "[StableMAC] $iface $current -> $mac"
+	else
+		echo "[StableMAC] failed to set $iface to $mac"
+		return 1
+	fi
+}
+
+case "$1" in
+	start|restart|reload)
+		[ -r "$CONFIG" ] || {
+			echo "[StableMAC] missing $CONFIG"
+			exit 1
+		}
+		while IFS='=' read -r iface mac; do
+			case "$iface" in
+				''|'#'*) continue ;;
+			esac
+			set_mac "$iface" "$mac"
+		done < "$CONFIG"
+		;;
+	stop)
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+		;;
+esac
+
+exit 0

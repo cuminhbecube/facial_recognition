@@ -1,0 +1,67 @@
+#!/bin/sh
+
+# Layout V2 GSHT persistent storage. This partition is formatted only when a
+# complete first NAND page proves that it is blank. A non-blank mount failure
+# is preserved for recovery and never reformatted automatically.
+
+MOUNT_POINT=/persist/gsht
+READY_FILE=/run/gshtdata.ready
+
+log() { echo "[GSHT_PARTITION] $*"; }
+
+clear_ready() {
+	rm -f "$READY_FILE" "$READY_FILE.new"
+}
+
+publish_ready() {
+	printf 'partition=gshtdata\nmount=%s\nfilesystem=jffs2\nlayout=V2\n' \
+		"$MOUNT_POINT" > "$READY_FILE.new" || return 1
+	mv -f "$READY_FILE.new" "$READY_FILE"
+}
+
+start_partition() {
+	clear_ready
+	mkdir -p /persist /run "$MOUNT_POINT" || return 1
+	mtd=$(awk -F: '$2 ~ /"gshtdata"/ { print "/dev/" $1; exit }' /proc/mtd)
+	if [ -z "$mtd" ]; then
+		log "state=UNAVAILABLE reason=PARTITION_NOT_FOUND no_fallback_to_dashcfg=1"
+		return 0
+	fi
+	block=$(echo "$mtd" | sed 's#/dev/mtd#/dev/mtdblock#')
+	if ! grep -q " $MOUNT_POINT jffs2 " /proc/mounts; then
+		if ! mount -t jffs2 "$block" "$MOUNT_POINT" 2>/dev/null; then
+			head=/tmp/gshtdata-head.bin
+			if ! nanddump -q -l 2048 -f "$head" "$mtd" >/dev/null 2>&1 ||
+			   [ "$(wc -c < "$head" 2>/dev/null)" != 2048 ]; then
+				rm -f "$head"
+				log "state=ERROR reason=BLANK_CHECK_FAILED no_auto_format=1"
+				return 0
+			fi
+			non_ff=$(od -An -tu1 -v "$head" 2>/dev/null | tr -s ' ' '\n' |
+				grep -v '^$' | grep -v '^255$' | head -n 1)
+			rm -f "$head"
+			if [ -n "$non_ff" ]; then
+				log "state=ERROR reason=MOUNT_FAILED_NONEMPTY no_auto_format=1 preserve_data=1"
+				return 0
+			fi
+			log "state=FORMAT reason=BLANK_PARTITION fs=jffs2 layout=V2"
+			if ! flash_erase -q -j "$mtd" 0 0 ||
+			   ! mount -t jffs2 "$block" "$MOUNT_POINT"; then
+				log "state=ERROR reason=FORMAT_OR_MOUNT_FAILED"
+				return 0
+			fi
+		fi
+	fi
+	publish_ready || {
+		log "state=ERROR reason=READY_MARKER_WRITE_FAILED"
+		return 0
+	}
+	log "state=READY partition=gshtdata fs=jffs2 mount=$MOUNT_POINT layout=V2"
+}
+
+case "$1" in
+	start|restart|reload) start_partition ;;
+	stop) clear_ready ;;
+	*) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+esac
+

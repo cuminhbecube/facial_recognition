@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# sshd        Starts sshd.
+#
+
+# Make sure the ssh-keygen progam exists
+umask 077
+
+start() {
+	if [ -d /sys/class/leds/fephy_spd_led ]; then
+		echo eth0 > /sys/class/leds/fephy_spd_led/device_name
+
+		# 有数据闪烁，无数据常亮
+		echo 1 > /sys/class/leds/fephy_spd_led/tx
+		echo 1 > /sys/class/leds/fephy_spd_led/rx
+		echo 1 > /sys/class/leds/fephy_spd_led/link
+	else
+		echo "no fephy_spd_led found"
+	fi
+
+	if [ -d /sys/class/leds/fephy_link_led ]; then
+		echo eth0 > /sys/class/leds/fephy_link_led/device_name
+		# 有连接常亮
+		echo 1 > /sys/class/leds/fephy_link_led/link
+	else
+		echo "no fephy_link_led found"
+	fi
+}
+stop() {
+	echo "OK"
+}
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart|reload)
+	restart
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

@@ -1,0 +1,364 @@
+#!/bin/sh
+
+PERSIST_ROOT=/persist
+PERSIST_DIR=$PERSIST_ROOT/dashcam
+DEFAULT_DIR=/oem/usr/etc/dashcam
+ACTIVE_LINK=/run/rv06-config
+MIGRATION_DIR=.rv06-config-migration
+TEMP_SD=/mnt/rv06-config-migration
+
+log() { echo "[CONFIG_PERSIST] $*"; }
+
+activate() {
+	rm -f "$ACTIVE_LINK"
+	ln -s "$1" "$ACTIVE_LINK" || return 1
+}
+
+copy_config_files() {
+	source=$1
+	destination=$2
+	for name in runtime.conf runtime.conf.backup jt808.conf jt808.conf.backup \
+		admin.password.hash admin.password.hash.backup wifi-ap.conf wifi-ap.conf.backup \
+		wifi-ap.psk wifi-ap.psk.backup driver.state driver.state.backup \
+		vehicle.conf vehicle.conf.backup snapshot.conf snapshot.conf.backup \
+		audio.conf audio.conf.backup \
+		device-identity.conf; do
+		if [ -f "$source/$name" ]; then
+			cp -f "$source/$name" "$destination/$name" || return 1
+		fi
+	done
+}
+
+# A missing marker is not evidence that this JFFS2 store is empty.  Older
+# firmware versions did not always create .initialized, and power loss can
+# remove only that marker.  In either case the configuration files are the
+# source of truth and must be migrated in place, never replaced by defaults.
+has_existing_config() {
+	for name in runtime.conf jt808.conf admin.password.hash wifi-ap.conf \
+		wifi-ap.psk vehicle.conf snapshot.conf audio.conf device-identity.conf; do
+		[ -f "$PERSIST_DIR/$name" ] && return 0
+	done
+	return 1
+}
+
+config_file_readable() {
+	[ -f "$1" ] && cat "$1" >/dev/null 2>&1
+}
+
+install_recovery_copy() {
+	source=$1
+	target=$2
+	mode=$3
+	stage=$target.recovery-new
+	cp -f "$source" "$stage" || { rm -f "$stage"; return 1; }
+	chmod "$mode" "$stage" || { rm -f "$stage"; return 1; }
+	# BusyBox mv tries to stat an existing destination first. That fails for a
+	# corrupt JFFS2 inode, so unlink only this already-proven-unreadable entry
+	# after its complete replacement has been written.
+	rm -f "$target" 2>/dev/null || { rm -f "$stage"; return 1; }
+	mv -f "$stage" "$target" || { rm -f "$stage"; return 1; }
+}
+
+# A single unreadable JFFS2 inode must not make every other persistent setting
+# fall back to firmware defaults. Recover only the affected file, preferring
+# its atomic backup and using the packaged default only as a last resort.
+recover_config_file() {
+	target=$1
+	backup=$2
+	default=$3
+	mode=$4
+	if config_file_readable "$target"; then
+		return 0
+	fi
+	if config_file_readable "$backup"; then
+		install_recovery_copy "$backup" "$target" "$mode" || return 1
+		log "recovery=FILE source=BACKUP target=$(basename "$target")"
+		return 0
+	fi
+	config_file_readable "$default" || return 1
+	install_recovery_copy "$default" "$target" "$mode" || return 1
+	log "recovery=FILE source=FIRMWARE_DEFAULT target=$(basename "$target")"
+}
+
+read_config_value() {
+	file=$1
+	key=$2
+	config_file_readable "$file" || return 1
+	sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n 1
+}
+
+ensure_vehicle_config() {
+	if config_file_readable "$PERSIST_DIR/vehicle.conf"; then
+		plate=$(read_config_value "$PERSIST_DIR/vehicle.conf" vehicle_plate)
+		echo "[VEHICLE] source=$ACTIVE_LINK/vehicle.conf plate=${plate:-UNSET} action=LOAD_EXISTING"
+		return 0
+	fi
+	if config_file_readable "$PERSIST_DIR/vehicle.conf.backup"; then
+		install_recovery_copy "$PERSIST_DIR/vehicle.conf.backup" \
+			"$PERSIST_DIR/vehicle.conf" 0600 || return 1
+		plate=$(read_config_value "$PERSIST_DIR/vehicle.conf" vehicle_plate)
+		echo "[VEHICLE] source=$ACTIVE_LINK/vehicle.conf.backup plate=${plate:-UNSET} action=LOAD_BACKUP"
+		log "recovery=VEHICLE source=BACKUP"
+		return 0
+	fi
+	plate=$(read_config_value "$PERSIST_DIR/runtime.conf" vehicle_plate)
+	[ -n "$plate" ] || plate=$(read_config_value "$PERSIST_DIR/jt808.conf" PLATE_NUMBER)
+	stage=$PERSIST_DIR/vehicle.conf.recovery-new
+	{
+		printf 'schema_version=1\n'
+		printf 'vehicle_plate=%s\n' "$plate"
+		printf 'vehicle_phone=\n'
+		printf 'company_name=\n'
+	} > "$stage" || { rm -f "$stage"; return 1; }
+	chmod 0600 "$stage" || { rm -f "$stage"; return 1; }
+	mv -f "$stage" "$PERSIST_DIR/vehicle.conf" || { rm -f "$stage"; return 1; }
+	cp -f "$PERSIST_DIR/vehicle.conf" "$PERSIST_DIR/vehicle.conf.backup" || return 1
+	chmod 0600 "$PERSIST_DIR/vehicle.conf.backup" || return 1
+	echo "[VEHICLE] source=$ACTIVE_LINK/vehicle.conf plate=${plate:-UNSET} action=$( [ -n "$plate" ] && echo MIGRATE_LEGACY || echo INIT_DEFAULT )"
+	log "recovery=VEHICLE source=$( [ -n "$plate" ] && echo LEGACY_CONFIG || echo EMPTY_DEFAULT )"
+}
+
+copy_readable_store() {
+	source=$1
+	destination=$2
+	for name in runtime.conf runtime.conf.backup jt808.conf jt808.conf.backup \
+		admin.password.hash admin.password.hash.backup wifi-ap.conf wifi-ap.conf.backup \
+		wifi-ap.psk wifi-ap.psk.backup driver.state driver.state.backup \
+		vehicle.conf vehicle.conf.backup snapshot.conf snapshot.conf.backup \
+		audio.conf audio.conf.backup \
+		device-identity.conf device_identity.conf; do
+		if config_file_readable "$source/$name"; then
+			cp -f "$source/$name" "$destination/$name" || return 1
+		elif [ -e "$source/$name" ]; then
+			log "recovery=SKIP_UNREADABLE file=$name"
+		fi
+	done
+}
+
+# Some JFFS2 inode failures cannot be unlinked in place. Build and validate a
+# new store beside the damaged directory, preserve every readable file, then
+# rename the old directory aside. The damaged data is retained for diagnosis;
+# no partition format or broad deletion is performed.
+rebuild_damaged_store() {
+	stage=$PERSIST_ROOT/dashcam.recovery-new
+	archive=$PERSIST_ROOT/dashcam.corrupt
+	index=0
+	while [ -e "$archive" ]; do
+		index=$((index + 1))
+		archive=$PERSIST_ROOT/dashcam.corrupt.$index
+	done
+	rm -rf "$stage" || return 1
+	mkdir -p "$stage" || return 1
+	copy_readable_store "$PERSIST_DIR" "$stage" || { rm -rf "$stage"; return 1; }
+	[ -f "$stage/device-identity.conf" ] || [ ! -f "$stage/device_identity.conf" ] ||
+		cp -f "$stage/device_identity.conf" "$stage/device-identity.conf" || return 1
+	config_file_readable "$stage/runtime.conf" ||
+		cp -f "$DEFAULT_DIR/runtime.conf" "$stage/runtime.conf" || return 1
+	config_file_readable "$stage/jt808.conf" ||
+		cp -f "$DEFAULT_DIR/jt808.conf" "$stage/jt808.conf" || return 1
+	config_file_readable "$stage/snapshot.conf" ||
+		cp -f "$DEFAULT_DIR/snapshot.conf" "$stage/snapshot.conf" || return 1
+	config_file_readable "$stage/audio.conf" ||
+		cp -f "$DEFAULT_DIR/audio.conf" "$stage/audio.conf" || return 1
+	config_file_readable "$stage/admin.password.hash" ||
+		cp -f "$DEFAULT_DIR/admin.password.hash" "$stage/admin.password.hash" || return 1
+	if ! config_file_readable "$stage/vehicle.conf"; then
+		if config_file_readable "$stage/vehicle.conf.backup"; then
+			cp -f "$stage/vehicle.conf.backup" "$stage/vehicle.conf" || return 1
+		else
+			plate=$(read_config_value "$stage/runtime.conf" vehicle_plate)
+			[ -n "$plate" ] || plate=$(read_config_value "$stage/jt808.conf" PLATE_NUMBER)
+			printf 'schema_version=1\nvehicle_plate=%s\nvehicle_phone=\ncompany_name=\n' \
+				"$plate" > "$stage/vehicle.conf" || return 1
+		fi
+	fi
+	cp -f "$stage/vehicle.conf" "$stage/vehicle.conf.backup" || return 1
+	chmod 0644 "$stage/runtime.conf" "$stage/snapshot.conf" "$stage/audio.conf" || return 1
+	chmod 0600 "$stage/jt808.conf" "$stage/admin.password.hash" \
+		"$stage/vehicle.conf" "$stage/vehicle.conf.backup" || return 1
+	[ ! -f "$stage/device-identity.conf" ] || chmod 0600 "$stage/device-identity.conf"
+	printf 'schema_version=3\n' > "$stage/.initialized" || return 1
+	sync
+	mv "$PERSIST_DIR" "$archive" || return 1
+	if ! mv "$stage" "$PERSIST_DIR"; then
+		mv "$archive" "$PERSIST_DIR" 2>/dev/null
+		return 1
+	fi
+	sync
+	log "recovery=STORE_REBUILT archive=$archive"
+}
+
+merge_missing_defaults() {
+	target=$1
+	defaults=$2
+	[ -f "$defaults" ] || return 0
+	if [ ! -f "$target" ]; then
+		cp -f "$defaults" "$target"
+		return $?
+	fi
+	stage=$target.schema-new
+	cp -f "$target" "$stage" || return 1
+	while IFS= read -r line; do
+		case "$line" in ''|'#'*) continue ;; esac
+		key=${line%%=*}
+		grep -q "^${key}=" "$target" 2>/dev/null || printf '%s\n' "$line" >> "$stage" || return 1
+	done < "$defaults"
+	mv "$stage" "$target"
+}
+
+migrate_store() {
+	recover_config_file "$PERSIST_DIR/runtime.conf" "$PERSIST_DIR/runtime.conf.backup" \
+		"$DEFAULT_DIR/runtime.conf" 0644 || return 1
+	recover_config_file "$PERSIST_DIR/jt808.conf" "$PERSIST_DIR/jt808.conf.backup" \
+		"$DEFAULT_DIR/jt808.conf" 0600 || return 1
+	recover_config_file "$PERSIST_DIR/snapshot.conf" "$PERSIST_DIR/snapshot.conf.backup" \
+		"$DEFAULT_DIR/snapshot.conf" 0644 || return 1
+	recover_config_file "$PERSIST_DIR/audio.conf" "$PERSIST_DIR/audio.conf.backup" \
+		"$DEFAULT_DIR/audio.conf" 0644 || return 1
+	recover_config_file "$PERSIST_DIR/admin.password.hash" \
+		"$PERSIST_DIR/admin.password.hash.backup" "$DEFAULT_DIR/admin.password.hash" 0600 || return 1
+	merge_missing_defaults "$PERSIST_DIR/runtime.conf" "$DEFAULT_DIR/runtime.conf" || return 1
+	merge_missing_defaults "$PERSIST_DIR/jt808.conf" "$DEFAULT_DIR/jt808.conf" || return 1
+	merge_missing_defaults "$PERSIST_DIR/snapshot.conf" "$DEFAULT_DIR/snapshot.conf" || return 1
+	merge_missing_defaults "$PERSIST_DIR/audio.conf" "$DEFAULT_DIR/audio.conf" || return 1
+	ensure_vehicle_config || return 1
+	chmod 0644 "$PERSIST_DIR/runtime.conf" "$PERSIST_DIR/snapshot.conf" "$PERSIST_DIR/audio.conf" || return 1
+	chmod 0600 "$PERSIST_DIR/jt808.conf" "$PERSIST_DIR/admin.password.hash" || return 1
+	chmod 0600 "$PERSIST_DIR/vehicle.conf" "$PERSIST_DIR/vehicle.conf.backup" || return 1
+	[ ! -f "$PERSIST_DIR/device-identity.conf" ] || chmod 0600 "$PERSIST_DIR/device-identity.conf"
+	printf 'schema_version=3\n' > "$PERSIST_DIR/.initialized" || return 1
+	sync
+}
+
+close_migration_mount() {
+	[ -z "$migration_mount" ] || umount "$migration_mount" 2>/dev/null
+}
+
+initialize_store() {
+	source=$DEFAULT_DIR
+	migration_mount=
+	if [ -b /dev/mmcblk1p1 ] &&
+	   [ "$(cat /sys/class/block/mmcblk1/device/type 2>/dev/null)" = SD ]; then
+		mkdir -p "$TEMP_SD"
+		if mount -t vfat -o rw /dev/mmcblk1p1 "$TEMP_SD" 2>/dev/null; then
+			migration_mount=$TEMP_SD
+			candidate=$TEMP_SD/$MIGRATION_DIR
+			if [ -f "$candidate/migration.complete" ] &&
+			   (cd "$candidate" && sha256sum -c manifest.sha256 >/dev/null 2>&1); then
+				source=$candidate
+				log "migration=VERIFIED source=SD"
+			else
+				log "migration=NOT_FOUND_OR_INVALID source=SD"
+			fi
+		fi
+	fi
+
+	stage=$PERSIST_ROOT/dashcam.new
+	rm -rf "$stage" || { close_migration_mount; return 1; }
+	mkdir -p "$stage" || { close_migration_mount; return 1; }
+	copy_config_files "$source" "$stage" || { rm -rf "$stage"; close_migration_mount; return 1; }
+	[ -f "$stage/runtime.conf" ] ||
+		cp -f "$DEFAULT_DIR/runtime.conf" "$stage/runtime.conf" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	[ -f "$stage/jt808.conf" ] ||
+		cp -f "$DEFAULT_DIR/jt808.conf" "$stage/jt808.conf" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	[ -f "$stage/admin.password.hash" ] ||
+		cp -f "$DEFAULT_DIR/admin.password.hash" "$stage/admin.password.hash" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	[ -f "$stage/snapshot.conf" ] ||
+		cp -f "$DEFAULT_DIR/snapshot.conf" "$stage/snapshot.conf" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	[ -f "$stage/audio.conf" ] ||
+		cp -f "$DEFAULT_DIR/audio.conf" "$stage/audio.conf" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	chmod 0600 "$stage/jt808.conf" "$stage/admin.password.hash" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	[ ! -f "$stage/wifi-ap.psk" ] || chmod 0600 "$stage/wifi-ap.psk"
+	[ ! -f "$stage/wifi-ap.conf" ] || chmod 0600 "$stage/wifi-ap.conf"
+	[ ! -f "$stage/vehicle.conf" ] || chmod 0600 "$stage/vehicle.conf"
+	[ ! -f "$stage/vehicle.conf.backup" ] || chmod 0600 "$stage/vehicle.conf.backup"
+	[ ! -f "$stage/device-identity.conf" ] || chmod 0600 "$stage/device-identity.conf"
+	chmod 0644 "$stage/runtime.conf" "$stage/audio.conf" || { rm -rf "$stage"; close_migration_mount; return 1; }
+	printf 'schema_version=3\n' > "$stage/.initialized" ||
+		{ rm -rf "$stage"; close_migration_mount; return 1; }
+	sync
+	rm -rf "$PERSIST_DIR" || { rm -rf "$stage"; close_migration_mount; return 1; }
+	mv "$stage" "$PERSIST_DIR" || { rm -rf "$stage"; close_migration_mount; return 1; }
+	sync
+	if [ -n "$migration_mount" ]; then
+		if [ "$source" != "$DEFAULT_DIR" ]; then
+			rm -rf "$migration_mount/$MIGRATION_DIR"
+			sync
+		fi
+		close_migration_mount
+	fi
+	log "state=INITIALIZED source=$( [ "$source" = "$DEFAULT_DIR" ] && echo FIRMWARE_DEFAULTS || echo SD_MIGRATION )"
+}
+
+start_store() {
+	mkdir -p "$PERSIST_ROOT" /run
+	mtd=$(awk -F: '$2 ~ /"dashcfg"/ { print "/dev/" $1; exit }' /proc/mtd)
+	if [ -z "$mtd" ]; then
+		activate "$DEFAULT_DIR"
+		log "state=FALLBACK reason=PARTITION_NOT_FOUND active=$DEFAULT_DIR"
+		return 0
+	fi
+	block=$(echo "$mtd" | sed 's#/dev/mtd#/dev/mtdblock#')
+	if ! grep -q " $PERSIST_ROOT jffs2 " /proc/mounts; then
+		if ! mount -t jffs2 "$block" "$PERSIST_ROOT" 2>/dev/null; then
+			head=/tmp/dashcfg-head.bin
+				if ! nanddump -q -l 2048 -f "$head" "$mtd" >/dev/null 2>&1 ||
+				   [ "$(wc -c < "$head" 2>/dev/null)" != 2048 ]; then
+					rm -f "$head"
+					activate "$DEFAULT_DIR"
+					log "state=FALLBACK reason=BLANK_CHECK_FAILED no_auto_format=1"
+					return 0
+				fi
+			non_ff=$(od -An -tu1 -v "$head" 2>/dev/null | tr -s ' ' '\n' |
+				grep -v '^$' | grep -v '^255$' | head -n 1)
+			rm -f "$head"
+			if [ -n "$non_ff" ]; then
+				activate "$DEFAULT_DIR"
+				log "state=FALLBACK reason=MOUNT_FAILED_NONEMPTY no_auto_format=1"
+				return 0
+			fi
+			log "state=FORMAT reason=BLANK_PARTITION fs=jffs2"
+			if ! flash_erase -q -j "$mtd" 0 0 ||
+			   ! mount -t jffs2 "$block" "$PERSIST_ROOT"; then
+				activate "$DEFAULT_DIR"
+				log "state=FALLBACK reason=FORMAT_OR_MOUNT_FAILED"
+				return 0
+			fi
+		fi
+	fi
+
+	if [ ! -f "$PERSIST_DIR/.initialized" ]; then
+		if has_existing_config; then
+			log "state=LOAD_EXISTING marker=MISSING action=MIGRATE_IN_PLACE"
+		else
+			initialize_store || {
+				activate "$DEFAULT_DIR"
+				log "state=FALLBACK reason=INITIALIZE_FAILED"
+				return 0
+			}
+		fi
+	fi
+	if ! migrate_store; then
+		log "recovery=STORE_REBUILD reason=IN_PLACE_RECOVERY_FAILED"
+		if ! rebuild_damaged_store || ! migrate_store; then
+			activate "$DEFAULT_DIR"
+			log "state=FALLBACK reason=MIGRATION_FAILED"
+			return 0
+		fi
+	fi
+	activate "$PERSIST_DIR"
+	echo "[PERSIST] dashcfg_mount=PASS"
+	log "state=READY partition=dashcfg fs=jffs2 active=$PERSIST_DIR"
+}
+
+case "$1" in
+	start|restart|reload) start_store ;;
+	stop) ;;
+	*) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+esac

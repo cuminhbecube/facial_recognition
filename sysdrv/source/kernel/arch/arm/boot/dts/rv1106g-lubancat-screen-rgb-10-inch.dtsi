@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2023 Rockchip Electronics Co., Ltd.
+ */
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/display/media-bus-format.h>
+
+/ {
+	panel: panel {
+		compatible = "simple-panel";
+		status = "okay";
+		backlight = <&backlight>;
+		bus-format = <MEDIA_BUS_FMT_RGB666_1X18>;
+        // enable-gpios = <&gpio0 RK_PA6 GPIO_ACTIVE_HIGH>;
+        // enable-delay-ms = <20>;
+
+		display-timings {
+			native-mode = <&timing0>;
+
+			timing0: timing0 {
+				clock-frequency = <53040000>;
+				hactive = <1024>;
+				vactive = <600>;
+				hback-porch = <160>;
+				hfront-porch = <160>;
+				vback-porch = <25>;
+				vfront-porch = <20>;
+				hsync-len = <16>;
+				vsync-len = <5>; //value range <2~22>
+				hsync-active = <0>;
+				vsync-active = <0>;
+				de-active = <0>;
+				pixelclk-active = <0>;
+			};
+		};
+
+		port {
+			panel_in_rgb: endpoint {
+				remote-endpoint = <&rgb_out_panel>;
+			};
+		};
+	};
+};
+
+&i2c4 {
+    status = "okay";
+    clock-frequency = <100000>;
+    pinctrl-names = "default";
+    pinctrl-0 = <&i2c4m2_xfer>;
+
+    hynitron@5a {
+        compatible = "hyn,3240";      //根据芯片型号配置
+        reg = <0x5a>;				  //根据芯片型号配置
+
+        interrupt-parent = <&gpio1>;   //根据平台配置
+        interrupts = <RK_PA4 IRQ_TYPE_LEVEL_LOW>;       //根据平台配置
+        reset-gpio = <&gpio1 RK_PA3 GPIO_ACTIVE_LOW>; //根据平台配置
+        irq-gpio = <&gpio1 RK_PA4 GPIO_ACTIVE_HIGH>;   //根据平台配置
+        
+        max-touch-number = <5>;
+        display-coords = <0 0 1024 600>;
+		pos-swap = <0>;     			//xy坐标交换
+		posx-reverse = <0>; 			//x坐标反向
+		posy-reverse = <0>; 			//y坐标反向
+    };
+};
+

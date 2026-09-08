@@ -1,0 +1,1 @@
+project/cfg/BoardConfig_IPC/BoardConfig-SPI_NAND-NONE-RV1106_Luckfox_Pico_Pro_Max-FACIAL_RECOGNITION.mk

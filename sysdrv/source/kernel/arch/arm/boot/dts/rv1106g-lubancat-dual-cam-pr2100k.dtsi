@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Dual AHD Camera via PR2100K Video Decoder on I2C4 (2-lane MIPI CSI-2)
+ *
+ * Copyright (c) 2026 Rockchip Electronics Co., Ltd.
+ */
+
+/ {
+	pr2100k_27m_clk: pr2100k-27m-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <27000000>;
+		clock-output-names = "pr2100k_27m_crystal";
+	};
+
+	cam_dovdd: cam-dovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_dovdd";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+
+	cam_avdd: cam-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_avdd";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+	};
+
+	cam_dvdd: cam-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_dvdd";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+	};
+};
+
+&csi2_dphy_hw {
+	status = "okay";
+};
+
+&csi2_dphy1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			cam0_dphy_in: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&pr2100k_out>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			cam0_dphy_out: endpoint {
+				remote-endpoint = <&mipi0_csi2_input>;
+			};
+		};
+	};
+};
+
+&i2c4 {
+	status = "okay";
+	clock-frequency = <400000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m2_xfer>;
+
+	pr2100k: pr2100k@5f {
+		compatible = "pixelplus,pr2100k";
+		status = "okay";
+		reg = <0x5f>;
+		clocks = <&pr2100k_27m_clk>;
+		clock-names = "xvclk";
+		pwdn-gpios = <&gpio5 0 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+		dovdd-supply = <&cam_dovdd>;
+		avdd-supply = <&cam_avdd>;
+		dvdd-supply = <&cam_dvdd>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "PR2100K-AHD";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			pr2100k_out: endpoint {
+				remote-endpoint = <&cam0_dphy_in>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&mipi0_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			mipi0_csi2_input: endpoint {
+				remote-endpoint = <&cam0_dphy_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			mipi0_csi2_output: endpoint {
+				remote-endpoint = <&cif_mipi_in0>;
+			};
+		};
+	};
+};
+
+&rkcif {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&mipi_pins>;
+};
+
+&rkcif_mipi_lvds {
+	status = "okay";
+	port {
+		cif_mipi_in0: endpoint {
+			remote-endpoint = <&mipi0_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds_sditf {
+	status = "okay";
+	port {
+		mipi_lvds0_sditf: endpoint {
+			remote-endpoint = <&isp_in0>;
+		};
+	};
+};
+
+&rkisp {
+	status = "okay";
+};
+
+&rkisp_vir0 {
+	status = "okay";
+	port@0 {
+		isp_in0: endpoint {
+			remote-endpoint = <&mipi_lvds0_sditf>;
+		};
+	};
+};
+
+&rkisp_vir1 {
+	status = "disabled";
+};

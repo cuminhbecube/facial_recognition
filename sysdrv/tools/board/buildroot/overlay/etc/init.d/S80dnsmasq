@@ -1,0 +1,3 @@
+#!/bin/sh
+# RV06 dnsmasq is started with an interface-scoped runtime config by S70rv06-wifi-ap.
+exit 0

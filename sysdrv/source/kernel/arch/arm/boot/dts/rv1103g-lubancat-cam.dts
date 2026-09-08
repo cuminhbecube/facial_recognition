@@ -1,0 +1,351 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2022 Rockchip Electronics Co., Ltd.
+ */
+
+/dts-v1/;
+
+#include "rv1103.dtsi"
+#include "rv1106-evb.dtsi"
+
+/ {
+	model = "Embedfire 38 AI CAM";
+	compatible = "embedfire,rv1103-ai-cam", "rockchip,rv1103";
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0xff4c0000 console=ttyFIQ0 root=/dev/mmcblk1p5 rootwait snd_soc_core.prealloc_buffer_size_kbytes=16 coherent_pool=0";
+	};
+
+	acodec_sound: acodec-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "rv-acodec";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,cpu {
+			sound-dai = <&i2s0_8ch>;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&acodec>;
+		};
+	};
+
+	vcc5v0_sys: vcc5v0-sys {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_sys";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+
+	vdd_0v9: vdd-0v9 {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_0v9";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <900000>;
+		regulator-max-microvolt = <900000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vcc_1v8: vcc-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_1v8";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	vcc_3v3: vcc-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_3v3";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc5v0_sys>;
+	};
+
+	wifi_usb: wifi-usb {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi_usb";
+		regulator-always-on;
+		enable-active-low;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;	
+		gpio = <&gpio1 RK_PC3 GPIO_ACTIVE_LOW>;
+	};
+
+	wireless_wlan: wireless-wlan {
+		compatible = "wlan-platdata";
+		wifi_chip_type = "AIC8800DC";
+		status = "okay";
+	};
+
+	adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 0>;
+		io-channel-names = "buttons";
+		poll-interval = <100>;
+		keyup-threshold-microvolt = <1800000>;
+
+		key_volumeup-key {
+			label = "key_volumeup";
+			linux,code = <KEY_VOLUMEUP>;
+			press-threshold-microvolt = <0>;
+		};
+	};
+
+};
+
+&acodec {
+	#sound-dai-cells = <0>;
+	status = "okay";
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_0v9>;
+};
+
+&csi2_dphy_hw {
+	status = "okay";
+};
+
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csi_dphy_input2: endpoint@2 {
+				reg = <2>;
+				remote-endpoint = <&sc4336_out>;
+				data-lanes = <1 2>;
+			};
+
+			// csi_dphy_input3: endpoint@3 {
+			// 	reg = <3>;
+			// 	remote-endpoint = <&sc235hai_out>;
+			// 	data-lanes = <1 2>;
+			// };
+			
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csi_dphy_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi_csi2_input>;
+			};
+		};
+	};
+};
+
+&gmac {
+	status = "okay";
+};
+
+&i2c4 {
+	status = "okay";
+	clock-frequency = <400000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m2_xfer>;
+
+	sc4336: sc4336@30 {
+		compatible = "smartsens,sc4336";
+		status = "okay";
+		reg = <0x30>;
+		clocks = <&cru MCLK_REF_MIPI0>;
+		clock-names = "xvclk";
+		pwdn-gpios = <&gpio1 RK_PC6 GPIO_ACTIVE_HIGH>;
+		// reset-gpios = <&gpio3 RK_PC5 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipi_refclk_out0>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "OT01";
+		rockchip,camera-module-lens-name = "40IRC_F16";
+		port {
+			sc4336_out: endpoint {
+				remote-endpoint = <&csi_dphy_input2>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+
+	// sc235hai: sc235hai@30 {
+	// 	compatible = "smartsens,sc235hai";
+	// 	status = "okay";
+	// 	reg = <0x30>;
+	// 	clocks = <&cru MCLK_REF_MIPI0>;
+	// 	clock-names = "xvclk";
+	// 	pwdn-gpios = <&gpio1 RK_PD2 GPIO_ACTIVE_HIGH>;
+	// 	reset-gpios = <&gpio3 RK_PC5 GPIO_ACTIVE_HIGH>;
+	// 	pinctrl-names = "rockchip,camera_default";
+	// 	pinctrl-0 = <&mipi_refclk_out0>;
+	// 	rockchip,camera-module-index = <0>;
+	// 	rockchip,camera-module-facing = "back";
+	// 	rockchip,camera-module-name = "CMK-OT2115-PC1";
+	// 	rockchip,camera-module-lens-name = "30IRC-F16";
+	// 	port {
+	// 		sc235hai_out: endpoint {
+	// 			remote-endpoint = <&csi_dphy_input3>;
+	// 			data-lanes = <1 2>;
+	// 		};
+	// 	};
+	// };
+};
+
+&i2s0_8ch {
+	#sound-dai-cells = <0>;
+	status = "okay";
+};
+
+&mipi0_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csi_dphy_output>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in>;
+			};
+		};
+	};
+};
+
+// PWM_INF
+&pwm0 {
+	status = "okay";
+};
+
+// PWM_WHITE
+&pwm1 {
+	status = "okay";
+};
+
+&rkcif {
+	status = "okay";
+};
+
+&rkcif_mipi_lvds {
+	status = "okay";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&mipi_pins>;
+	port {
+		/* MIPI CSI-2 endpoint */
+		cif_mipi_in: endpoint {
+			remote-endpoint = <&mipi_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mipi_lvds_sditf {
+	status = "okay";
+
+	port {
+		/* MIPI CSI-2 endpoint */
+		mipi_lvds_sditf: endpoint {
+			remote-endpoint = <&isp_in>;
+		};
+	};
+};
+
+&rkisp {
+	status = "okay";
+};
+
+&rkisp_vir0 {
+	status = "okay";
+
+	port@0 {
+		isp_in: endpoint {
+			remote-endpoint = <&mipi_lvds_sditf>;
+		};
+	};
+};
+
+&saradc {
+	status = "okay";
+	vref-supply = <&vcc_1v8>;
+};
+
+&sdmmc {
+    max-frequency = <50000000>;
+    no-sdio;
+    no-mmc;
+    bus-width = <4>;
+    cap-mmc-highspeed;
+    cap-sd-highspeed;
+    disable-wp;
+    pinctrl-names = "default";
+    pinctrl-0 = <&sdmmc0_clk &sdmmc0_cmd &sdmmc0_det &sdmmc0_bus4>;
+    status = "okay";
+};
+
+&sfc {
+	status = "okay";
+
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		spi-max-frequency = <75000000>;
+		spi-rx-bus-width = <4>;
+		spi-tx-bus-width = <1>;
+	};
+};
+
+&u2phy {
+	status = "okay";
+};
+
+&u2phy_otg {
+	status = "okay";
+};
+
+&usbdrd {
+	status = "okay";
+};
+
+&usbdrd_dwc3 {
+	extcon = <&u2phy>;
+	dr_mode = "otg";
+	status = "okay";
+};
+
+&i2c3 {
+	status = "okay";
+	clock-frequency = <400000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c3m1_xfer>;
+};
